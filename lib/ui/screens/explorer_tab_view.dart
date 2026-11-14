@@ -3,10 +3,12 @@ import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/cloud/cloud_credentials.dart';
 import '../../core/cloud/cloud_item.dart';
 import '../../core/database/transfer_task_entity.dart';
 import '../../core/transfer/recursive_folder_handler.dart';
+import '../../core/utils/sort_utils.dart';
 import '../../state/accounts_provider.dart';
 import '../../state/transfer_queue_provider.dart';
 import '../widgets/breadcrumb_bar.dart';
@@ -38,11 +40,61 @@ class _ExplorerTabViewState extends ConsumerState<ExplorerTabView> {
   // Navigation Stack (id, name)
   final List<MapEntry<String, String>> _folderStack = [];
 
+  static const String _prefSortFieldKey = 'explorer_sort_field';
+  static const String _prefSortAscKey = 'explorer_sort_ascending';
+  SortField _sortField = SortField.name;
+  bool _sortAscending = true;
+
   @override
   void initState() {
     super.initState();
+    _loadSortPreference();
     _folderStack.add(MapEntry('root', widget.account.type == CloudProviderType.local ? '내 기기' : '홈'));
     _loadFolder();
+  }
+
+  Future<void> _loadSortPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedField = prefs.getString(_prefSortFieldKey);
+    final savedAsc = prefs.getBool(_prefSortAscKey);
+    if (mounted) {
+      setState(() {
+        if (savedField != null) {
+          _sortField = SortField.values.firstWhere(
+            (f) => f.name == savedField,
+            orElse: () => SortField.name,
+          );
+        }
+        if (savedAsc != null) {
+          _sortAscending = savedAsc;
+        }
+        _items = SortUtils.sortCloudItems(
+          _items,
+          field: _sortField,
+          ascending: _sortAscending,
+        );
+      });
+    }
+  }
+
+  Future<void> _changeSort(SortField field, {required bool ascending}) async {
+    setState(() {
+      _sortField = field;
+      _sortAscending = ascending;
+      _items = SortUtils.sortCloudItems(
+        _items,
+        field: _sortField,
+        ascending: _sortAscending,
+      );
+    });
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefSortFieldKey, field.name);
+    await prefs.setBool(_prefSortAscKey, ascending);
+  }
+
+  void _onSelectSortField(SortField field) {
+    final nextAsc = field == _sortField ? !_sortAscending : field.defaultAscending;
+    _changeSort(field, ascending: nextAsc);
   }
 
   Future<void> _loadFolder() async {
@@ -58,7 +110,11 @@ class _ExplorerTabViewState extends ConsumerState<ExplorerTabView> {
       final fetched = await provider.listItems(folderIdOrPath: currentFolderId);
       if (mounted) {
         setState(() {
-          _items = fetched;
+          _items = SortUtils.sortCloudItems(
+            fetched,
+            field: _sortField,
+            ascending: _sortAscending,
+          );
           _isLoading = false;
         });
       }
@@ -269,6 +325,8 @@ class _ExplorerTabViewState extends ConsumerState<ExplorerTabView> {
                       '총 ${_items.length}개 항목',
                       style: const TextStyle(fontSize: 12, color: Colors.white54),
                     ),
+                    const SizedBox(width: 10),
+                    _buildSortMenuButton(),
                     const Spacer(),
                     IconButton(
                       icon: const Icon(Icons.upload_file_outlined, size: 20),
@@ -416,6 +474,131 @@ class _ExplorerTabViewState extends ConsumerState<ExplorerTabView> {
             ),
         ],
       ),
+    );
+  }
+
+  Widget _buildSortMenuButton() {
+    return PopupMenuButton<String>(
+      tooltip: '정렬 기준 (${_sortField.label} ${_sortAscending ? "오름차순" : "내림차순"})',
+      onSelected: (value) {
+        if (value == 'dir:asc') {
+          _changeSort(_sortField, ascending: true);
+        } else if (value == 'dir:desc') {
+          _changeSort(_sortField, ascending: false);
+        } else if (value.startsWith('field:')) {
+          final name = value.substring('field:'.length);
+          final field = SortField.values.firstWhere(
+            (f) => f.name == name,
+            orElse: () => SortField.name,
+          );
+          _onSelectSortField(field);
+        }
+      },
+      child: Container(
+        height: 30,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(
+          color: Colors.white.withAlpha(15),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.sort_rounded, size: 15, color: Colors.blueAccent),
+            const SizedBox(width: 4),
+            Text(
+              _sortField.label,
+              style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: Colors.white),
+            ),
+            const SizedBox(width: 2),
+            Icon(
+              _sortAscending ? Icons.arrow_upward_rounded : Icons.arrow_downward_rounded,
+              size: 13,
+              color: Colors.blueAccent,
+            ),
+          ],
+        ),
+      ),
+      itemBuilder: (context) => [
+        ...SortField.values.map((field) {
+          final isSelected = field == _sortField;
+          return PopupMenuItem<String>(
+            value: 'field:${field.name}',
+            child: Row(
+              children: [
+                Icon(
+                  field.icon,
+                  size: 18,
+                  color: isSelected ? Colors.blueAccent : Colors.white70,
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  field.label,
+                  style: TextStyle(
+                    fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                    color: isSelected ? Colors.blueAccent : Colors.white,
+                  ),
+                ),
+                const Spacer(),
+                if (isSelected)
+                  Icon(
+                    _sortAscending ? Icons.arrow_upward_rounded : Icons.arrow_downward_rounded,
+                    size: 16,
+                    color: Colors.blueAccent,
+                  ),
+              ],
+            ),
+          );
+        }),
+        const PopupMenuDivider(),
+        PopupMenuItem<String>(
+          value: 'dir:asc',
+          child: Row(
+            children: [
+              Icon(
+                Icons.arrow_upward_rounded,
+                size: 18,
+                color: _sortAscending ? Colors.blueAccent : Colors.white70,
+              ),
+              const SizedBox(width: 10),
+              Text(
+                '오름차순',
+                style: TextStyle(
+                  fontWeight: _sortAscending ? FontWeight.bold : FontWeight.normal,
+                  color: _sortAscending ? Colors.blueAccent : Colors.white,
+                ),
+              ),
+              const Spacer(),
+              if (_sortAscending)
+                const Icon(Icons.check, size: 16, color: Colors.blueAccent),
+            ],
+          ),
+        ),
+        PopupMenuItem<String>(
+          value: 'dir:desc',
+          child: Row(
+            children: [
+              Icon(
+                Icons.arrow_downward_rounded,
+                size: 18,
+                color: !_sortAscending ? Colors.blueAccent : Colors.white70,
+              ),
+              const SizedBox(width: 10),
+              Text(
+                '내림차순',
+                style: TextStyle(
+                  fontWeight: !_sortAscending ? FontWeight.bold : FontWeight.normal,
+                  color: !_sortAscending ? Colors.blueAccent : Colors.white,
+                ),
+              ),
+              const Spacer(),
+              if (!_sortAscending)
+                const Icon(Icons.check, size: 16, color: Colors.blueAccent),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }

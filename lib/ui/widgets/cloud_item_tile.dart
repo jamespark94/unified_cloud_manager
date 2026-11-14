@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 import '../../core/cloud/cloud_item.dart';
 import '../../core/utils/format_utils.dart';
+import '../../core/utils/sort_utils.dart';
 
 class CloudItemTile extends StatelessWidget {
   final CloudItem item;
@@ -38,9 +40,14 @@ class CloudItemTile extends StatelessWidget {
           ),
         ),
         subtitle: item.isFolder
-            ? const Text('폴더', style: TextStyle(fontSize: 11, color: Colors.white54))
+            ? Text(
+                item.modifiedTime != null
+                    ? '폴더 • ${DateFormat("yyyy-MM-dd HH:mm").format(item.modifiedTime!)}'
+                    : '폴더',
+                style: const TextStyle(fontSize: 11, color: Colors.white54),
+              )
             : Text(
-                '${item.size != null ? FormatUtils.formatBytes(item.size!) : "크기 미상"} • ${item.modifiedTime != null ? item.modifiedTime!.toString().split(" ").first : ""}',
+                '${SortUtils.getCloudItemTypeLabel(item)} • ${item.size != null ? FormatUtils.formatBytes(item.size!) : "크기 미상"}${item.modifiedTime != null ? " • ${DateFormat("yyyy-MM-dd HH:mm").format(item.modifiedTime!)}" : ""}',
                 style: const TextStyle(fontSize: 11, color: Colors.white54),
               ),
         trailing: isSelected
