@@ -90,7 +90,13 @@ class Win32Window {
   // Update the window frame's theme to match the system theme.
   static void UpdateTheme(HWND const window);
 
+  // Persist and restore window size, position, and maximized state.
+  static bool LoadWindowPlacement(WINDOWPLACEMENT* placement);
+  static void SaveWindowPlacement(HWND const window);
+
   bool quit_on_close_ = false;
+  bool has_shown_ = false;
+  int saved_show_cmd_ = SW_SHOWNORMAL;
 
   // window handle for top level window.
   HWND window_handle_ = nullptr;

@@ -24,8 +24,9 @@ class AppDatabase {
     await _db?.close();
     _db = await openDatabase(
       inMemoryDatabasePath,
-      version: 1,
+      version: 2,
       onCreate: _onCreate,
+      onUpgrade: _onUpgrade,
     );
   }
 
@@ -34,6 +35,8 @@ class AppDatabase {
       CREATE TABLE transfer_tasks (
         id TEXT PRIMARY KEY,
         group_id TEXT,
+        group_name TEXT,
+        relative_path TEXT,
         provider_type TEXT NOT NULL,
         source_account_id TEXT NOT NULL,
         dest_account_id TEXT NOT NULL,
@@ -56,6 +59,13 @@ class AppDatabase {
     ''');
   }
 
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      await db.execute('ALTER TABLE transfer_tasks ADD COLUMN group_name TEXT');
+      await db.execute('ALTER TABLE transfer_tasks ADD COLUMN relative_path TEXT');
+    }
+  }
+
   Future<Database> _initDb() async {
     if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
       sqfliteFfiInit();
@@ -65,8 +75,9 @@ class AppDatabase {
     final dbPath = await _getDatabasePath();
     return await openDatabase(
       dbPath,
-      version: 1,
+      version: 2,
       onCreate: _onCreate,
+      onUpgrade: _onUpgrade,
     );
   }
 
@@ -231,5 +242,45 @@ class AppDatabase {
         TransferStatus.paused.name,
       ],
     );
+  }
+
+  Future<List<TransferTask>> getTasksByGroupId(String groupId) async {
+    final db = await database;
+    final list = await db.query(
+      'transfer_tasks',
+      where: 'group_id = ?',
+      whereArgs: [groupId],
+      orderBy: 'created_at ASC',
+    );
+    return list.map((m) => TransferTask.fromMap(m)).toList();
+  }
+
+  Future<int> pauseGroupTasks(String groupId) async {
+    final db = await database;
+    return await db.update(
+      'transfer_tasks',
+      {'status': TransferStatus.paused.name, 'updated_at': DateTime.now().millisecondsSinceEpoch},
+      where: 'group_id = ? AND status IN (?, ?)',
+      whereArgs: [groupId, TransferStatus.pending.name, TransferStatus.active.name],
+    );
+  }
+
+  Future<void> cancelGroupIncompleteTasks(String groupId) async {
+    final db = await database;
+    await db.delete(
+      'transfer_tasks',
+      where: 'group_id = ? AND status IN (?, ?, ?)',
+      whereArgs: [
+        groupId,
+        TransferStatus.pending.name,
+        TransferStatus.active.name,
+        TransferStatus.paused.name,
+      ],
+    );
+  }
+
+  Future<void> deleteGroupTasks(String groupId) async {
+    final db = await database;
+    await db.delete('transfer_tasks', where: 'group_id = ?', whereArgs: [groupId]);
   }
 }

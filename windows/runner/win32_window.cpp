@@ -25,6 +25,9 @@ constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
 constexpr const wchar_t kGetPreferredBrightnessRegKey[] =
   L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 constexpr const wchar_t kGetPreferredBrightnessRegValue[] = L"AppsUseLightTheme";
+constexpr const wchar_t kWindowPlacementRegKey[] =
+  L"Software\\UnifiedCloudManager\\Window";
+constexpr const wchar_t kWindowPlacementRegValue[] = L"Placement";
 
 // The number of Win32Window objects that currently exist.
 static int g_active_window_count = 0;
@@ -144,13 +147,23 @@ bool Win32Window::Create(const std::wstring& title,
     return false;
   }
 
+  WINDOWPLACEMENT saved_placement{};
+  if (LoadWindowPlacement(&saved_placement)) {
+    saved_show_cmd_ = (saved_placement.showCmd == SW_SHOWMAXIMIZED)
+                          ? SW_SHOWMAXIMIZED
+                          : SW_SHOWNORMAL;
+    saved_placement.showCmd = SW_HIDE;
+    SetWindowPlacement(window, &saved_placement);
+  }
+
   UpdateTheme(window);
 
   return OnCreate();
 }
 
 bool Win32Window::Show() {
-  return ShowWindow(window_handle_, SW_SHOWNORMAL);
+  has_shown_ = true;
+  return ShowWindow(window_handle_, saved_show_cmd_);
 }
 
 // static
@@ -179,11 +192,26 @@ Win32Window::MessageHandler(HWND hwnd,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
   switch (message) {
+    case WM_CLOSE:
+      if (has_shown_) {
+        SaveWindowPlacement(hwnd);
+      }
+      break;
+
     case WM_DESTROY:
+      if (has_shown_) {
+        SaveWindowPlacement(hwnd);
+      }
       window_handle_ = nullptr;
       Destroy();
       if (quit_on_close_) {
         PostQuitMessage(0);
+      }
+      return 0;
+
+    case WM_EXITSIZEMOVE:
+      if (has_shown_) {
+        SaveWindowPlacement(hwnd);
       }
       return 0;
 
@@ -203,6 +231,9 @@ Win32Window::MessageHandler(HWND hwnd,
         // Size and position the child window.
         MoveWindow(child_content_, rect.left, rect.top, rect.right - rect.left,
                    rect.bottom - rect.top, TRUE);
+      }
+      if (has_shown_ && (wparam == SIZE_MAXIMIZED || wparam == SIZE_RESTORED)) {
+        SaveWindowPlacement(hwnd);
       }
       return 0;
     }
@@ -284,5 +315,60 @@ void Win32Window::UpdateTheme(HWND const window) {
     BOOL enable_dark_mode = light_mode == 0;
     DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
                           &enable_dark_mode, sizeof(enable_dark_mode));
+  }
+}
+
+bool Win32Window::LoadWindowPlacement(WINDOWPLACEMENT* placement) {
+  if (!placement) {
+    return false;
+  }
+  WINDOWPLACEMENT loaded{};
+  DWORD size = sizeof(loaded);
+  LSTATUS result = RegGetValueW(
+      HKEY_CURRENT_USER, kWindowPlacementRegKey, kWindowPlacementRegValue,
+      RRF_RT_REG_BINARY, nullptr, &loaded, &size);
+  if (result != ERROR_SUCCESS || size != sizeof(WINDOWPLACEMENT) ||
+      loaded.length != sizeof(WINDOWPLACEMENT)) {
+    return false;
+  }
+  const LONG width =
+      loaded.rcNormalPosition.right - loaded.rcNormalPosition.left;
+  const LONG height =
+      loaded.rcNormalPosition.bottom - loaded.rcNormalPosition.top;
+  if (width < 320 || height < 240) {
+    return false;
+  }
+  *placement = loaded;
+  return true;
+}
+
+void Win32Window::SaveWindowPlacement(HWND const window) {
+  if (!window || !IsWindow(window)) {
+    return;
+  }
+  WINDOWPLACEMENT wp{};
+  wp.length = sizeof(WINDOWPLACEMENT);
+  if (!GetWindowPlacement(window, &wp)) {
+    return;
+  }
+  if (wp.showCmd == SW_SHOWMINIMIZED) {
+    wp.showCmd = (wp.flags & WPF_RESTORETOMAXIMIZED) ? SW_SHOWMAXIMIZED
+                                                     : SW_SHOWNORMAL;
+  } else if (wp.showCmd != SW_SHOWMAXIMIZED) {
+    wp.showCmd = SW_SHOWNORMAL;
+  }
+  const LONG width = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+  const LONG height = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+  if (width < 320 || height < 240) {
+    return;
+  }
+
+  HKEY key = nullptr;
+  if (RegCreateKeyExW(HKEY_CURRENT_USER, kWindowPlacementRegKey, 0, nullptr,
+                      REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &key,
+                      nullptr) == ERROR_SUCCESS) {
+    RegSetValueExW(key, kWindowPlacementRegValue, 0, REG_BINARY,
+                   reinterpret_cast<const BYTE*>(&wp), sizeof(wp));
+    RegCloseKey(key);
   }
 }

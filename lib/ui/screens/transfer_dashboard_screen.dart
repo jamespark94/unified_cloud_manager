@@ -3,8 +3,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/database/app_database.dart';
 import '../../core/database/transfer_task_entity.dart';
 import '../../core/transfer/transfer_queue_manager.dart';
+import '../../core/transfer/transfer_tree_builder.dart';
 import '../../core/utils/format_utils.dart';
 import '../../state/transfer_queue_provider.dart';
+import '../widgets/transfer_folder_group_card.dart';
 import '../widgets/transfer_task_card.dart';
 
 class TransferDashboardScreen extends ConsumerStatefulWidget {
@@ -17,6 +19,8 @@ class TransferDashboardScreen extends ConsumerStatefulWidget {
 class _TransferDashboardScreenState extends ConsumerState<TransferDashboardScreen> {
   List<TransferTask> _cachedTasks = [];
   bool _isLoading = true;
+  int _lastObservedVersion = -1;
+  bool _isFetching = false;
 
   @override
   void initState() {
@@ -25,12 +29,18 @@ class _TransferDashboardScreenState extends ConsumerState<TransferDashboardScree
   }
 
   Future<void> _fetchTasks() async {
-    final tasks = await AppDatabase.instance.getAllTasks();
-    if (mounted) {
-      setState(() {
-        _cachedTasks = tasks;
-        _isLoading = false;
-      });
+    if (_isFetching) return;
+    _isFetching = true;
+    try {
+      final tasks = await AppDatabase.instance.getAllTasks();
+      if (mounted) {
+        setState(() {
+          _cachedTasks = tasks;
+          _isLoading = false;
+        });
+      }
+    } finally {
+      _isFetching = false;
     }
   }
 
@@ -75,8 +85,15 @@ class _TransferDashboardScreenState extends ConsumerState<TransferDashboardScree
   Widget build(BuildContext context) {
     // Only rebuild for speed meter and task progress mapping
     final queueMgr = ref.watch(transferQueueManagerProvider);
+    if (_lastObservedVersion != queueMgr.taskListVersion) {
+      _lastObservedVersion = queueMgr.taskListVersion;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _fetchTasks();
+      });
+    }
     final progressMap = queueMgr.taskProgressMap;
     final hasIncomplete = _hasIncompleteTasks(progressMap);
+    final entries = TransferTreeBuilder.buildDashboardEntries(_cachedTasks, progressMap);
 
     return Scaffold(
       appBar: AppBar(
@@ -232,11 +249,11 @@ class _TransferDashboardScreenState extends ConsumerState<TransferDashboardScree
               ),
             ),
 
-            // Tasks List without blinking
+            // Tasks List without blinking (grouped folders as expandable trees + standalone files)
             Expanded(
               child: _isLoading
                   ? const Center(child: CircularProgressIndicator())
-                  : _cachedTasks.isEmpty
+                  : entries.isEmpty
                       ? const Center(
                           child: Column(
                             mainAxisSize: MainAxisSize.min,
@@ -249,27 +266,66 @@ class _TransferDashboardScreenState extends ConsumerState<TransferDashboardScree
                         )
                       : ListView.builder(
                           padding: const EdgeInsets.symmetric(vertical: 8),
-                          itemCount: _cachedTasks.length,
+                          itemCount: entries.length,
                           itemBuilder: (context, index) {
-                            final task = _cachedTasks[index];
-                            final progressInfo = progressMap[task.id];
-                            return TransferTaskCard(
-                              key: ValueKey(task.id),
-                              task: task,
-                              progressInfo: progressInfo,
-                              onPause: () async {
-                                await queueMgr.pauseTask(task.id);
-                                await _fetchTasks();
-                              },
-                              onResume: () async {
-                                await queueMgr.resumeTask(task.id);
-                                await _fetchTasks();
-                              },
-                              onCancel: () async {
-                                await queueMgr.cancelTask(task.id);
-                                await _fetchTasks();
-                              },
-                            );
+                            final entry = entries[index];
+                            if (entry is TransferGroupEntry) {
+                              final g = entry.group;
+                              return TransferFolderGroupCard(
+                                key: ValueKey('group_${g.groupId}'),
+                                group: g,
+                                onPauseGroup: () async {
+                                  await queueMgr.pauseGroup(g.groupId);
+                                  await _fetchTasks();
+                                },
+                                onResumeGroup: () async {
+                                  await queueMgr.resumeGroup(g.groupId);
+                                  await _fetchTasks();
+                                },
+                                onCancelGroup: () async {
+                                  final hasIncompleteInGroup =
+                                      g.activeFiles > 0 || g.pendingFiles > 0 || g.pausedFiles > 0;
+                                  if (hasIncompleteInGroup) {
+                                    await queueMgr.cancelGroup(g.groupId);
+                                  } else {
+                                    await queueMgr.removeGroup(g.groupId);
+                                  }
+                                  await _fetchTasks();
+                                },
+                                onPauseTask: (taskId) async {
+                                  await queueMgr.pauseTask(taskId);
+                                  await _fetchTasks();
+                                },
+                                onResumeTask: (taskId) async {
+                                  await queueMgr.resumeTask(taskId);
+                                  await _fetchTasks();
+                                },
+                                onCancelTask: (taskId) async {
+                                  await queueMgr.cancelTask(taskId);
+                                  await _fetchTasks();
+                                },
+                              );
+                            } else {
+                              final task = (entry as TransferSingleTaskEntry).task;
+                              final progressInfo = progressMap[task.id];
+                              return TransferTaskCard(
+                                key: ValueKey(task.id),
+                                task: task,
+                                progressInfo: progressInfo,
+                                onPause: () async {
+                                  await queueMgr.pauseTask(task.id);
+                                  await _fetchTasks();
+                                },
+                                onResume: () async {
+                                  await queueMgr.resumeTask(task.id);
+                                  await _fetchTasks();
+                                },
+                                onCancel: () async {
+                                  await queueMgr.cancelTask(task.id);
+                                  await _fetchTasks();
+                                },
+                              );
+                            }
                           },
                         ),
             ),

@@ -32,21 +32,16 @@ class RecursiveFolderHandler {
     );
 
     final List<TransferTask> plannedTasks = [];
+    int taskSeq = 0;
 
-    // 2. 재귀 탐색 큐 (소스 폴더, 대상 폴더 매핑)
-    final queue = <({String srcPath, String dstPath})>[
-      (srcPath: sourceFolderIdOrPath, dstPath: rootDestFolder.id)
+    // 2. 재귀 탐색 큐 (소스 폴더, 대상 폴더, 상대 경로)
+    final queue = <({String srcPath, String dstPath, String relDir})>[
+      (srcPath: sourceFolderIdOrPath, dstPath: rootDestFolder.id, relDir: '')
     ];
 
     while (queue.isNotEmpty) {
       final current = queue.removeAt(0);
-
-      List<CloudItem> items = [];
-      if (srcProvider.providerType == CloudProviderType.local) {
-        items = await srcProvider.listItems(folderIdOrPath: current.srcPath);
-      } else {
-        items = await srcProvider.listItems(folderIdOrPath: current.srcPath);
-      }
+      final items = await srcProvider.listItems(folderIdOrPath: current.srcPath);
 
       for (final item in items) {
         if (item.isFolder) {
@@ -55,16 +50,20 @@ class RecursiveFolderHandler {
             parentId: current.dstPath,
             folderName: item.name,
           );
-          queue.add((srcPath: item.id, dstPath: subDstFolder.id));
+          final nextRelDir = current.relDir.isEmpty ? item.name : '${current.relDir}/${item.name}';
+          queue.add((srcPath: item.id, dstPath: subDstFolder.id, relDir: nextRelDir));
         } else {
           // 파일 전송 작업 큐에 등록
           final taskType = _determineTaskType(srcProvider, dstProvider);
-          final taskId = 'task_${DateTime.now().microsecondsSinceEpoch}_${item.name.hashCode}';
+          final relPath = current.relDir.isEmpty ? item.name : '${current.relDir}/${item.name}';
+          final taskId = 'task_${DateTime.now().microsecondsSinceEpoch}_${taskSeq++}_${item.name.hashCode}';
 
           plannedTasks.add(
             TransferTask(
               id: taskId,
               groupId: groupId,
+              groupName: sourceFolderName,
+              relativePath: relPath,
               providerType: srcProvider.providerType.code,
               sourceAccountId: sourceAccountId,
               destAccountId: destAccountId,

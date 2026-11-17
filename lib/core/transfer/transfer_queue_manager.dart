@@ -8,6 +8,7 @@ import '../database/app_database.dart';
 import '../database/transfer_task_entity.dart';
 import '../utils/format_utils.dart';
 import 'background_service_handler.dart';
+import 'speed_estimator.dart';
 
 class TaskProgressInfo {
   final int transferredBytes;
@@ -83,11 +84,16 @@ class TransferQueueManager extends ChangeNotifier {
   final Map<String, TaskProgressInfo> _taskProgressMap = {};
   Map<String, TaskProgressInfo> get taskProgressMap => Map.unmodifiable(_taskProgressMap);
 
-  // Speed calculation metrics
+  // Speed calculation metrics (smoothed via sliding window + EMA)
   double currentSpeedBytesPerSec = 0.0;
-  int _lastCumulativeBytes = 0;
-  DateTime _lastSpeedCalcTime = DateTime.now();
+  final SlidingWindowSpeedEstimator _globalSpeedEstimator = SlidingWindowSpeedEstimator();
+  final Map<String, SlidingWindowSpeedEstimator> _taskSpeedEstimators = {};
+  final Map<String, int> _lastRecordedTaskBytes = {};
   Timer? _speedMeterTimer;
+  double _lastNotifiedGlobalSpeed = 0.0;
+
+  int _taskListVersion = 0;
+  int get taskListVersion => _taskListVersion;
 
   bool _isProcessing = false;
 
@@ -104,8 +110,14 @@ class TransferQueueManager extends ChangeNotifier {
   Future<void> init() async {
     // 1. Reset interrupted active tasks to pending
     await _db.resetInterruptedActiveTasks();
+    _taskSpeedEstimators.clear();
+    _lastRecordedTaskBytes.clear();
+    _globalSpeedEstimator.reset();
+    currentSpeedBytesPerSec = 0.0;
+    _lastNotifiedGlobalSpeed = 0.0;
 
     // 2. Restore progress map so UI shows persisted transferredBytes immediately
+    _taskProgressMap.clear();
     final existingTasks = await _db.getAllTasks();
     for (final task in existingTasks) {
       _taskProgressMap[task.id] = TaskProgressInfo(
@@ -115,6 +127,7 @@ class TransferQueueManager extends ChangeNotifier {
         status: task.status,
       );
     }
+    _taskListVersion++;
 
     // 3. Start speed calculator loop (every 500ms)
     _speedMeterTimer?.cancel();
@@ -128,29 +141,32 @@ class TransferQueueManager extends ChangeNotifier {
   }
 
   void _calculateGlobalSpeed() {
-    final now = DateTime.now();
-    final elapsedSec = now.difference(_lastSpeedCalcTime).inMilliseconds / 1000.0;
-    if (elapsedSec <= 0.1) return;
-
     if (_activeTaskIds.isEmpty) {
+      _globalSpeedEstimator.reset();
       currentSpeedBytesPerSec = 0.0;
-      _lastCumulativeBytes = 0;
-    } else {
-      int currentTotal = 0;
-      for (final p in _taskProgressMap.values) {
-        if (p.status == TransferStatus.active) {
-          currentTotal += p.transferredBytes;
-        }
+      if (_lastNotifiedGlobalSpeed != 0.0) {
+        _lastNotifiedGlobalSpeed = 0.0;
+        notifyListeners();
       }
-
-      if (_lastCumulativeBytes > 0 && currentTotal >= _lastCumulativeBytes) {
-        final diff = currentTotal - _lastCumulativeBytes;
-        currentSpeedBytesPerSec = diff / elapsedSec;
-      }
-      _lastCumulativeBytes = currentTotal;
+      return;
     }
 
-    _lastSpeedCalcTime = now;
+    currentSpeedBytesPerSec = _globalSpeedEstimator.tick();
+    for (final taskId in _activeTaskIds) {
+      final estimator = _taskSpeedEstimators[taskId];
+      final existing = _taskProgressMap[taskId];
+      if (estimator != null && existing != null && existing.status == TransferStatus.active) {
+        final nextSpeed = estimator.tick();
+        _taskProgressMap[taskId] = TaskProgressInfo(
+          transferredBytes: existing.transferredBytes,
+          totalBytes: existing.totalBytes,
+          speedBytesPerSec: nextSpeed,
+          status: existing.status,
+        );
+      }
+    }
+
+    _lastNotifiedGlobalSpeed = currentSpeedBytesPerSec;
     notifyListeners();
   }
 
@@ -163,6 +179,7 @@ class TransferQueueManager extends ChangeNotifier {
       speedBytesPerSec: 0.0,
       status: task.status,
     );
+    _taskListVersion++;
     notifyListeners();
     processQueue();
   }
@@ -180,12 +197,15 @@ class TransferQueueManager extends ChangeNotifier {
         status: task.status,
       );
     }
+    _taskListVersion++;
     notifyListeners();
     processQueue();
   }
 
   Future<void> pauseTask(String taskId) async {
     final control = _activeControls[taskId];
+    _taskSpeedEstimators.remove(taskId);
+    _lastRecordedTaskBytes.remove(taskId);
     if (_taskProgressMap.containsKey(taskId)) {
       final old = _taskProgressMap[taskId]!;
       _taskProgressMap[taskId] = TaskProgressInfo(
@@ -205,8 +225,8 @@ class TransferQueueManager extends ChangeNotifier {
     _activeTaskIds.remove(taskId);
     await _db.updateTaskStatus(taskId, TransferStatus.paused);
     if (_activeTaskIds.isEmpty) {
+      _globalSpeedEstimator.reset();
       currentSpeedBytesPerSec = 0.0;
-      _lastCumulativeBytes = 0;
       await BackgroundServiceManager.instance.stopServiceIfIdle();
     }
     notifyListeners();
@@ -231,11 +251,14 @@ class TransferQueueManager extends ChangeNotifier {
 
   Future<void> cancelTask(String taskId) async {
     _cancelledTaskIds.add(taskId);
+    _taskSpeedEstimators.remove(taskId);
+    _lastRecordedTaskBytes.remove(taskId);
     final task = await _db.getTaskById(taskId);
     final control = _activeControls[taskId];
 
     _activeTaskIds.remove(taskId);
     _taskProgressMap.remove(taskId);
+    _taskListVersion++;
     notifyListeners();
 
     if (control != null) {
@@ -249,8 +272,8 @@ class TransferQueueManager extends ChangeNotifier {
 
     await _db.deleteTask(taskId);
     if (_activeTaskIds.isEmpty) {
+      _globalSpeedEstimator.reset();
       currentSpeedBytesPerSec = 0.0;
-      _lastCumulativeBytes = 0;
       await BackgroundServiceManager.instance.stopServiceIfIdle();
     }
     notifyListeners();
@@ -270,6 +293,8 @@ class TransferQueueManager extends ChangeNotifier {
 
     for (final t in incompleteTasks) {
       _cancelledTaskIds.add(t.id);
+      _taskSpeedEstimators.remove(t.id);
+      _lastRecordedTaskBytes.remove(t.id);
     }
     _cancelledTaskIds.addAll(_activeTaskIds);
 
@@ -281,8 +306,9 @@ class TransferQueueManager extends ChangeNotifier {
           p.status == TransferStatus.active ||
           p.status == TransferStatus.paused,
     );
+    _globalSpeedEstimator.reset();
     currentSpeedBytesPerSec = 0.0;
-    _lastCumulativeBytes = 0;
+    _taskListVersion++;
     notifyListeners();
 
     await Future.wait(controls.map((c) => c.abort(cancelled: true)));
@@ -304,6 +330,8 @@ class TransferQueueManager extends ChangeNotifier {
     for (final entry in _taskProgressMap.entries.toList()) {
       if (entry.value.status == TransferStatus.active ||
           entry.value.status == TransferStatus.pending) {
+        _taskSpeedEstimators.remove(entry.key);
+        _lastRecordedTaskBytes.remove(entry.key);
         _taskProgressMap[entry.key] = TaskProgressInfo(
           transferredBytes: entry.value.transferredBytes,
           totalBytes: entry.value.totalBytes,
@@ -320,8 +348,8 @@ class TransferQueueManager extends ChangeNotifier {
       controls.map((c) => c.finished.future.timeout(const Duration(seconds: 5), onTimeout: () {})),
     );
     _activeTaskIds.clear();
+    _globalSpeedEstimator.reset();
     currentSpeedBytesPerSec = 0.0;
-    _lastCumulativeBytes = 0;
     await BackgroundServiceManager.instance.stopServiceIfIdle();
     notifyListeners();
   }
@@ -347,9 +375,126 @@ class TransferQueueManager extends ChangeNotifier {
     processQueue();
   }
 
+  Future<void> pauseGroup(String groupId) async {
+    final tasks = await _db.getTasksByGroupId(groupId);
+    await _db.pauseGroupTasks(groupId);
+    final activeControlsToAbort = <_ActiveTransferControl>[];
+
+    for (final t in tasks) {
+      final info = _taskProgressMap[t.id];
+      final status = info?.status ?? t.status;
+      if (status == TransferStatus.active || status == TransferStatus.pending) {
+        _taskSpeedEstimators.remove(t.id);
+        _lastRecordedTaskBytes.remove(t.id);
+        _activeTaskIds.remove(t.id);
+        final ctrl = _activeControls[t.id];
+        if (ctrl != null) {
+          activeControlsToAbort.add(ctrl);
+        }
+        _taskProgressMap[t.id] = TaskProgressInfo(
+          transferredBytes: info?.transferredBytes ?? t.transferredBytes,
+          totalBytes: info?.totalBytes ?? t.totalBytes,
+          speedBytesPerSec: 0.0,
+          status: TransferStatus.paused,
+        );
+      }
+    }
+    _taskListVersion++;
+    notifyListeners();
+
+    await Future.wait(activeControlsToAbort.map((c) => c.abort(cancelled: false)));
+    await Future.wait(
+      activeControlsToAbort.map((c) => c.finished.future.timeout(const Duration(seconds: 5), onTimeout: () {})),
+    );
+
+    if (_activeTaskIds.isEmpty) {
+      _globalSpeedEstimator.reset();
+      currentSpeedBytesPerSec = 0.0;
+      await BackgroundServiceManager.instance.stopServiceIfIdle();
+    }
+    notifyListeners();
+    processQueue();
+  }
+
+  Future<void> resumeGroup(String groupId) async {
+    final tasks = await _db.getTasksByGroupId(groupId);
+    for (final t in tasks) {
+      final status = _taskProgressMap[t.id]?.status ?? t.status;
+      if (status == TransferStatus.paused || status == TransferStatus.failed) {
+        _cancelledTaskIds.remove(t.id);
+        await _db.updateTaskStatus(t.id, TransferStatus.pending, retryCount: 0);
+        final old = _taskProgressMap[t.id];
+        _taskProgressMap[t.id] = TaskProgressInfo(
+          transferredBytes: old?.transferredBytes ?? t.transferredBytes,
+          totalBytes: old?.totalBytes ?? t.totalBytes,
+          speedBytesPerSec: 0.0,
+          status: TransferStatus.pending,
+        );
+      }
+    }
+    _taskListVersion++;
+    notifyListeners();
+    processQueue();
+  }
+
+  Future<void> cancelGroup(String groupId) async {
+    final tasks = await _db.getTasksByGroupId(groupId);
+    final incompleteTasks = tasks.where((t) {
+      final status = _taskProgressMap[t.id]?.status ?? t.status;
+      return status == TransferStatus.pending ||
+          status == TransferStatus.active ||
+          status == TransferStatus.paused;
+    }).toList();
+
+    final controlsToAbort = <_ActiveTransferControl>[];
+    for (final t in incompleteTasks) {
+      _cancelledTaskIds.add(t.id);
+      _taskSpeedEstimators.remove(t.id);
+      _lastRecordedTaskBytes.remove(t.id);
+      _activeTaskIds.remove(t.id);
+      _taskProgressMap.remove(t.id);
+      final ctrl = _activeControls[t.id];
+      if (ctrl != null) {
+        controlsToAbort.add(ctrl);
+      }
+    }
+    _taskListVersion++;
+    notifyListeners();
+
+    await Future.wait(controlsToAbort.map((c) => c.abort(cancelled: true)));
+    await Future.wait(
+      controlsToAbort.map((c) => c.finished.future.timeout(const Duration(seconds: 5), onTimeout: () {})),
+    );
+
+    for (final t in incompleteTasks) {
+      await _deleteLocalPartialFileForTask(t);
+    }
+
+    await _db.cancelGroupIncompleteTasks(groupId);
+    if (_activeTaskIds.isEmpty) {
+      _globalSpeedEstimator.reset();
+      currentSpeedBytesPerSec = 0.0;
+      await BackgroundServiceManager.instance.stopServiceIfIdle();
+    }
+    notifyListeners();
+    processQueue();
+  }
+
+  Future<void> removeGroup(String groupId) async {
+    await cancelGroup(groupId);
+    final tasks = await _db.getTasksByGroupId(groupId);
+    for (final t in tasks) {
+      _taskProgressMap.remove(t.id);
+    }
+    await _db.deleteGroupTasks(groupId);
+    _taskListVersion++;
+    notifyListeners();
+  }
+
   Future<void> clearCompleted() async {
     await _db.clearCompletedTasks();
     _taskProgressMap.removeWhere((_, p) => p.status == TransferStatus.completed || p.status == TransferStatus.failed);
+    _taskListVersion++;
     notifyListeners();
   }
 
@@ -458,8 +603,9 @@ class TransferQueueManager extends ChangeNotifier {
       }
 
       transferred = actualStartByte;
-      int lastTaskBytes = actualStartByte;
-      DateTime lastSpeedTime = DateTime.now();
+      _lastRecordedTaskBytes[task.id] = actualStartByte;
+      _taskSpeedEstimators[task.id] = SlidingWindowSpeedEstimator();
+      DateTime lastNotifyTime = DateTime.now();
       DateTime lastDbWriteTime = DateTime.now();
 
       if (transferred != task.transferredBytes) {
@@ -516,7 +662,7 @@ class TransferQueueManager extends ChangeNotifier {
         cancelOnError: true,
       );
 
-      // Throttled progress callback
+      // Throttled progress callback with smoothed byte-delta tracking
       void onProgress(int bytesSent, int totalBytes) {
         if (control.isCancelled || control.isPaused || _cancelledTaskIds.contains(task.id)) {
           return;
@@ -524,22 +670,23 @@ class TransferQueueManager extends ChangeNotifier {
         transferred = bytesSent;
         if (totalBytes > 0) total = totalBytes;
 
-        final now = DateTime.now();
-        final elapsed = now.difference(lastSpeedTime).inMilliseconds / 1000.0;
-        double taskSpeed = 0.0;
-        if (elapsed >= 0.5) {
-          taskSpeed = (transferred - lastTaskBytes) / elapsed;
-          lastTaskBytes = transferred;
-          lastSpeedTime = now;
+        final prevRecorded = _lastRecordedTaskBytes[task.id] ?? actualStartByte;
+        final delta = transferred - prevRecorded;
+        if (delta > 0) {
+          _lastRecordedTaskBytes[task.id] = transferred;
+          _taskSpeedEstimators[task.id]?.recordBytes(delta);
+          _globalSpeedEstimator.recordBytes(delta);
         }
 
+        final taskSpeed = _taskSpeedEstimators[task.id]?.currentSpeed ?? 0.0;
         _taskProgressMap[task.id] = TaskProgressInfo(
           transferredBytes: transferred,
           totalBytes: total,
-          speedBytesPerSec: taskSpeed > 0 ? taskSpeed : (_taskProgressMap[task.id]?.speedBytesPerSec ?? 0.0),
+          speedBytesPerSec: taskSpeed,
           status: TransferStatus.active,
         );
 
+        final now = DateTime.now();
         // SQLite write throttled to once every 1000ms
         if (now.difference(lastDbWriteTime).inMilliseconds >= 1000) {
           lastDbWriteTime = now;
@@ -557,7 +704,12 @@ class TransferQueueManager extends ChangeNotifier {
             text: '$percent% (${FormatUtils.formatBytes(transferred)} / ${FormatUtils.formatBytes(total)})',
           );
         }
-        notifyListeners();
+
+        // Throttle UI notifications to avoid rebuilding on every small socket chunk
+        if (now.difference(lastNotifyTime).inMilliseconds >= 200) {
+          lastNotifyTime = now;
+          notifyListeners();
+        }
       }
 
       if (dstProvider is LocalStorageProvider) {
@@ -625,6 +777,7 @@ class TransferQueueManager extends ChangeNotifier {
           status: TransferStatus.pending,
         );
         _activeTaskIds.remove(task.id);
+        _taskListVersion++;
         notifyListeners();
         Future.delayed(Duration(seconds: backoffDelay), () => processQueue());
       } else {
@@ -646,6 +799,8 @@ class TransferQueueManager extends ChangeNotifier {
       }
       _activeControls.remove(task.id);
       _activeTaskIds.remove(task.id);
+      _taskSpeedEstimators.remove(task.id);
+      _lastRecordedTaskBytes.remove(task.id);
       if (!control.finished.isCompleted) {
         control.finished.complete();
       }
@@ -661,6 +816,8 @@ class TransferQueueManager extends ChangeNotifier {
   }
 
   Future<void> _savePausedState(String taskId, int transferred, int total) async {
+    _taskSpeedEstimators.remove(taskId);
+    _lastRecordedTaskBytes.remove(taskId);
     await _db.updateTaskProgress(
       id: taskId,
       transferredBytes: transferred,
@@ -677,6 +834,8 @@ class TransferQueueManager extends ChangeNotifier {
 
   Future<void> _markCompleted(TransferTask task, int total, int transferred) async {
     final finalBytes = total > 0 ? total : transferred;
+    _taskSpeedEstimators.remove(task.id);
+    _lastRecordedTaskBytes.remove(task.id);
     await _db.updateTaskProgress(
       id: task.id,
       transferredBytes: finalBytes,
@@ -690,12 +849,15 @@ class TransferQueueManager extends ChangeNotifier {
       status: TransferStatus.completed,
     );
     _activeTaskIds.remove(task.id);
+    _taskListVersion++;
     notifyListeners();
     processQueue();
   }
 
   Future<void> _failTask(TransferTask task, String error) async {
     _activeTaskIds.remove(task.id);
+    _taskSpeedEstimators.remove(task.id);
+    _lastRecordedTaskBytes.remove(task.id);
     _taskProgressMap[task.id] = TaskProgressInfo(
       transferredBytes: task.transferredBytes,
       totalBytes: task.totalBytes,
@@ -709,6 +871,7 @@ class TransferQueueManager extends ChangeNotifier {
       status: TransferStatus.failed,
       errorMessage: error,
     );
+    _taskListVersion++;
     notifyListeners();
     processQueue();
   }

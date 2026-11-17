@@ -113,7 +113,7 @@ class TransferTaskCard extends StatelessWidget {
               Text(
                 task.errorMessage!,
                 style: const TextStyle(fontSize: 11, color: Colors.redAccent),
-                maxLines: 1,
+                maxLines: 2,
                 overflow: TextOverflow.ellipsis,
               ),
             ],

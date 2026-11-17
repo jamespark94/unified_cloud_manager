@@ -15,6 +15,11 @@ enum CloudItemMenuAction {
 class CloudItemTile extends StatelessWidget {
   final CloudItem item;
   final bool isSelected;
+  final bool showCheckbox;
+  final int treeDepth;
+  final bool? isExpanded;
+  final bool isExpandLoading;
+  final VoidCallback? onToggleExpand;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
   final VoidCallback? onOpen;
@@ -27,6 +32,11 @@ class CloudItemTile extends StatelessWidget {
     super.key,
     required this.item,
     this.isSelected = false,
+    this.showCheckbox = false,
+    this.treeDepth = 0,
+    this.isExpanded,
+    this.isExpandLoading = false,
+    this.onToggleExpand,
     required this.onTap,
     required this.onLongPress,
     this.onOpen,
@@ -45,13 +55,65 @@ class CloudItemTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    final hasTreeControls = treeDepth > 0 || onToggleExpand != null || isExpandLoading;
+
+    return Material(
       color: isSelected ? Colors.blueAccent.withAlpha(35) : Colors.transparent,
       child: ListTile(
         onTap: onTap,
         onLongPress: onLongPress,
         dense: true,
-        leading: _buildLeadingIcon(),
+        contentPadding: hasTreeControls
+            ? EdgeInsets.only(left: 6.0 + treeDepth * 18.0, right: 8.0)
+            : null,
+        leading: (showCheckbox || hasTreeControls)
+            ? Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (hasTreeControls) ...[
+                    SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: isExpandLoading
+                          ? const Padding(
+                              padding: EdgeInsets.all(4),
+                              child: CircularProgressIndicator(strokeWidth: 1.5),
+                            )
+                          : (item.isFolder && onToggleExpand != null)
+                              ? IconButton(
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(),
+                                  tooltip: isExpanded == true ? '접기' : '펼치기',
+                                  icon: Icon(
+                                    isExpanded == true
+                                        ? Icons.keyboard_arrow_down
+                                        : Icons.keyboard_arrow_right,
+                                    size: 18,
+                                    color: Colors.white70,
+                                  ),
+                                  onPressed: onToggleExpand,
+                                )
+                              : const SizedBox.shrink(),
+                    ),
+                    const SizedBox(width: 2),
+                  ],
+                  if (showCheckbox) ...[
+                    SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: Checkbox(
+                        value: isSelected,
+                        onChanged: (_) => (onSelect ?? onLongPress)(),
+                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                  _buildLeadingIcon(),
+                ],
+              )
+            : _buildLeadingIcon(),
         title: Text(
           item.name,
           maxLines: 1,

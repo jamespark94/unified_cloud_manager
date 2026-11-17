@@ -12,7 +12,8 @@ class BaiduProvider implements CloudStorageProvider {
   final Future<void> Function(CloudAccount)? onAccountUpdated;
   final Dio _dio = Dio(
     BaseOptions(
-      connectTimeout: const Duration(seconds: 20),
+      connectTimeout: const Duration(seconds: 15),
+      receiveTimeout: const Duration(seconds: 30),
     ),
   );
 
@@ -44,7 +45,10 @@ class BaiduProvider implements CloudStorageProvider {
   CloudProviderType get providerType => CloudProviderType.baidu;
 
   String get _cookieHeader {
-    final token = account.accessToken.trim();
+    var token = account.accessToken.replaceAll(RegExp(r'[\r\n]+'), ' ').trim();
+    if (token.toLowerCase().startsWith('cookie:')) {
+      token = token.substring(7).trim();
+    }
     var cookie = token.contains('=') ? token : 'BDUSS=$token';
     if (!cookie.contains('PANWEB=')) {
       cookie = 'PANWEB=1; $cookie';
@@ -302,16 +306,20 @@ class BaiduProvider implements CloudStorageProvider {
     }
 
     final jsToken = await _ensureJsToken(cancelToken: cancelToken);
+    final failureReasons = <String>[];
     final candidateUrls = await _collectCandidateDownloadUrls(
       fsId: fsId,
       filePath: filePath,
       jsToken: jsToken,
       cancelToken: cancelToken,
+      failureReasons: failureReasons,
     );
 
     const userAgents = [
       pcsUserAgent,
+      'netdisk;P2SP;3.0.10.22',
       'netdisk;12.1.2;android;android-android;12;SM-A908N',
+      'pan.baidu.com',
       defaultUserAgent,
     ];
 
@@ -325,6 +333,7 @@ class BaiduProvider implements CloudStorageProvider {
           endByte: endByte,
           cancelToken: cancelToken,
           onActualStartByte: onActualStartByte,
+          failureReasons: failureReasons,
         );
         if (stream != null) {
           return stream;
@@ -332,7 +341,78 @@ class BaiduProvider implements CloudStorageProvider {
       }
     }
 
-    throw Exception('Baidu 파일 다운로드 스트림 연결 실패 (모든 엔드포인트 거부)');
+    final detail = failureReasons.isNotEmpty ? ' - ${failureReasons.last}' : '';
+    throw Exception('Baidu 파일 다운로드 스트림 연결 실패 (모든 엔드포인트 거부$detail)');
+  }
+
+  String _calcSign(String s1, String s2) {
+    if (s1.isEmpty || s2.isEmpty) return '';
+    final a = List<int>.filled(256, 0);
+    final p = List<int>.filled(256, 0);
+    final o = <int>[];
+    final v = s1.length;
+
+    for (int q = 0; q < 256; q++) {
+      a[q] = s1.codeUnitAt(q % v);
+      p[q] = q;
+    }
+
+    int u = 0;
+    for (int q = 0; q < 256; q++) {
+      u = (u + p[q] + a[q]) % 256;
+      final t = p[q];
+      p[q] = p[u];
+      p[u] = t;
+    }
+
+    int i = 0;
+    u = 0;
+    for (int q = 0; q < s2.length; q++) {
+      i = (i + 1) % 256;
+      u = (u + p[i]) % 256;
+      final t = p[i];
+      p[i] = p[u];
+      p[u] = t;
+      final k = p[(p[i] + p[u]) % 256];
+      o.add(s2.codeUnitAt(q) ^ k);
+    }
+
+    return base64Encode(o);
+  }
+
+  Future<({String sign, String timestamp, String bdstoken})?> _fetchDownloadSign({
+    CancelToken? cancelToken,
+  }) async {
+    try {
+      final uri = Uri.parse('https://pan.baidu.com/api/gettemplatevariable').replace(
+        queryParameters: {
+          'app_id': appId,
+          'web': '1',
+          'channel': 'chunlei',
+          'clienttype': '0',
+          'fields': '["sign1","sign2","sign3","timestamp","bdstoken"]',
+        },
+      );
+      final data = await _getJsonMap(uri.toString(), cancelToken: cancelToken);
+      if (data != null && data['errno'] == 0 && data['result'] is Map) {
+        final result = data['result'] as Map;
+        final sign1 = result['sign1']?.toString() ?? '';
+        final sign3 = result['sign3']?.toString() ?? '';
+        final timestamp = result['timestamp']?.toString() ?? '';
+        final bdstoken = result['bdstoken']?.toString() ?? '';
+        if (sign1.isNotEmpty && sign3.isNotEmpty && timestamp.isNotEmpty) {
+          return (
+            sign: _calcSign(sign3, sign1),
+            timestamp: timestamp,
+            bdstoken: bdstoken,
+          );
+        }
+      }
+    } catch (e) {
+      if (e is DioException && e.type == DioExceptionType.cancel) rethrow;
+      debugPrint('[BaiduProvider] gettemplatevariable failed: $e');
+    }
+    return null;
   }
 
   Future<Map<String, dynamic>?> _getJsonMap(
@@ -371,6 +451,7 @@ class BaiduProvider implements CloudStorageProvider {
     required String filePath,
     String? jsToken,
     CancelToken? cancelToken,
+    List<String>? failureReasons,
   }) async {
     final candidateUrls = <String>[];
     void addUrl(String? url) {
@@ -381,33 +462,42 @@ class BaiduProvider implements CloudStorageProvider {
 
     // 1. PCS locatedownload (대용량 파일/비디오 고속 직링크 CDN 목록)
     if (filePath.isNotEmpty) {
-      final pcsUrl =
-          'https://d.pcs.baidu.com/rest/2.0/pcs/file?method=locatedownload&app_id=$appId&path=${Uri.encodeComponent(filePath)}&ver=2.0&dtype=1&esl=1';
-      final data = await _getJsonMap(
-        pcsUrl,
-        headers: {
-          'User-Agent': pcsUserAgent,
-          'Cookie': _cookieHeader,
-          'Referer': 'https://pan.baidu.com/',
-        },
-        cancelToken: cancelToken,
-      );
-      if (data != null) {
-        final urls = data['urls'];
-        if (urls is List) {
-          for (final entry in urls) {
-            if (entry is Map) {
-              addUrl(entry['url']?.toString());
+      for (final aid in const [appId, '778750', '266719']) {
+        final pcsUrl =
+            'https://d.pcs.baidu.com/rest/2.0/pcs/file?method=locatedownload&app_id=$aid&path=${Uri.encodeComponent(filePath)}&ver=2.0&dtype=1&esl=1';
+        final data = await _getJsonMap(
+          pcsUrl,
+          headers: {
+            'User-Agent': pcsUserAgent,
+            'Cookie': _cookieHeader,
+            'Referer': 'https://pan.baidu.com/',
+          },
+          cancelToken: cancelToken,
+        );
+        if (data != null) {
+          final urls = data['urls'];
+          if (urls is List) {
+            for (final entry in urls) {
+              if (entry is Map) {
+                addUrl(entry['url']?.toString());
+              }
             }
           }
-        }
-        if (data['server'] != null && data['path'] != null) {
-          addUrl('${data['server']}${data['path']}');
+          if (data['server'] != null && data['path'] != null) {
+            final serverStr = data['server'].toString();
+            if (serverStr.startsWith('http')) {
+              addUrl('$serverStr${data['path']}');
+            }
+          }
+          if (data['error_code'] != null) {
+            failureReasons?.add('locatedownload($aid): ${data['error_code']} ${data['error_msg'] ?? ''}');
+          }
+          if (candidateUrls.isNotEmpty) break;
         }
       }
     }
 
-    // 2. pan.baidu.com /api/filemetas (dlink 추출)
+    // 2. pan.baidu.com /api/filemetas & xpan filemetas (dlink 추출)
     if (fsId.isNotEmpty || filePath.isNotEmpty) {
       final queryParams = <String, String>{
         'app_id': appId,
@@ -415,6 +505,7 @@ class BaiduProvider implements CloudStorageProvider {
         'channel': 'chunlei',
         'clienttype': '0',
         'dlink': '1',
+        'origin': 'dlna',
         if (jsToken != null && jsToken.isNotEmpty) 'jsToken': jsToken,
       };
       if (fsId.isNotEmpty) {
@@ -433,22 +524,46 @@ class BaiduProvider implements CloudStorageProvider {
           (data['info'] as List).isNotEmpty) {
         addUrl(data['info'][0]['dlink']?.toString());
       } else if (data != null) {
+        failureReasons?.add('filemetas: errno=${data['errno']}');
         debugPrint('[BaiduProvider] filemetas unexpected response: $data');
+      }
+
+      if (fsId.isNotEmpty) {
+        final xpanUri = Uri.parse('https://pan.baidu.com/rest/2.0/xpan/multimedia').replace(
+          queryParameters: {
+            'method': 'filemetas',
+            'fsids': '[$fsId]',
+            'dlink': '1',
+          },
+        );
+        final xpanData = await _getJsonMap(xpanUri.toString(), cancelToken: cancelToken);
+        if (xpanData != null &&
+            xpanData['errno'] == 0 &&
+            xpanData['list'] is List &&
+            (xpanData['list'] as List).isNotEmpty) {
+          addUrl(xpanData['list'][0]['dlink']?.toString());
+        }
       }
     }
 
-    // 3. pan.baidu.com /api/download JSON API에서 dlink 추출 (JSON 자체를 파일로 저장하지 않음)
+    // 3. pan.baidu.com /api/download JSON API에서 dlink 추출 (sign + timestamp 포함)
     if (fsId.isNotEmpty) {
+      final signInfo = await _fetchDownloadSign(cancelToken: cancelToken);
+      final dlParams = <String, String>{
+        'app_id': appId,
+        'web': '1',
+        'channel': 'chunlei',
+        'clienttype': '0',
+        'type': 'dlink',
+        'fidlist': '[$fsId]',
+        'vip': '2',
+        if (jsToken != null && jsToken.isNotEmpty) 'jsToken': jsToken,
+        if (signInfo != null) 'sign': signInfo.sign,
+        if (signInfo != null) 'timestamp': signInfo.timestamp,
+        if (signInfo != null && signInfo.bdstoken.isNotEmpty) 'bdstoken': signInfo.bdstoken,
+      };
       final dlUri = Uri.parse('https://pan.baidu.com/api/download').replace(
-        queryParameters: {
-          'app_id': appId,
-          'web': '1',
-          'channel': 'chunlei',
-          'clienttype': '0',
-          'type': 'dlink',
-          'fidlist': '[$fsId]',
-          if (jsToken != null && jsToken.isNotEmpty) 'jsToken': jsToken,
-        },
+        queryParameters: dlParams,
       );
       final data = await _getJsonMap(dlUri.toString(), cancelToken: cancelToken);
       if (data != null &&
@@ -456,14 +571,18 @@ class BaiduProvider implements CloudStorageProvider {
           data['dlink'] is List &&
           (data['dlink'] as List).isNotEmpty) {
         addUrl(data['dlink'][0]['dlink']?.toString());
+      } else if (data != null) {
+        failureReasons?.add('api/download: errno=${data['errno']}');
       }
     }
 
-    // 4. 폴백: PCS direct method=download (소용량 파일용)
+    // 4. 폴백: PCS direct method=download
     if (filePath.isNotEmpty) {
-      addUrl(
-        'https://d.pcs.baidu.com/rest/2.0/pcs/file?method=download&app_id=$appId&path=${Uri.encodeComponent(filePath)}',
-      );
+      for (final aid in const ['778750', '266719', appId]) {
+        addUrl(
+          'https://d.pcs.baidu.com/rest/2.0/pcs/file?method=download&app_id=$aid&path=${Uri.encodeComponent(filePath)}',
+        );
+      }
     }
 
     return candidateUrls;
@@ -494,6 +613,7 @@ class BaiduProvider implements CloudStorageProvider {
     int? endByte,
     CancelToken? cancelToken,
     void Function(int actualStartByte)? onActualStartByte,
+    List<String>? failureReasons,
   }) async {
     var currentUrl = initialUrl;
 
@@ -517,6 +637,7 @@ class BaiduProvider implements CloudStorageProvider {
             headers: headers,
             responseType: ResponseType.stream,
             followRedirects: false,
+            receiveTimeout: const Duration(seconds: 25),
             validateStatus: (status) => status != null && status >= 200 && status < 400,
           ),
         );
@@ -533,6 +654,7 @@ class BaiduProvider implements CloudStorageProvider {
         }
 
         if (statusCode != 200 && statusCode != 206) {
+          failureReasons?.add('HTTP $statusCode ($userAgent)');
           await _cancelStream(response.data?.stream);
           return null;
         }
@@ -557,6 +679,7 @@ class BaiduProvider implements CloudStorageProvider {
             (contentType.contains('application/json') ||
                 contentType.contains('text/html') ||
                 contentType.contains('text/xml'))) {
+          failureReasons?.add('Content-Type=$contentType ($userAgent)');
           await _cancelStream(response.data?.stream);
           debugPrint('[BaiduProvider] Rejected non-file content-type ($contentType) from $currentUrl');
           return null;
@@ -582,10 +705,11 @@ class BaiduProvider implements CloudStorageProvider {
           }
 
           if (_looksLikeErrorPayload(initialBuffer)) {
+            final errPreview = utf8.decode(initialBuffer, allowMalformed: true).trim();
+            failureReasons?.add(errPreview);
             await iterator.cancel();
             debugPrint(
-              '[BaiduProvider] Rejected error payload ($currentUrl, $userAgent): '
-              '${utf8.decode(initialBuffer, allowMalformed: true)}',
+              '[BaiduProvider] Rejected error payload ($currentUrl, $userAgent): $errPreview',
             );
             return null;
           }
@@ -616,9 +740,12 @@ class BaiduProvider implements CloudStorageProvider {
         if (e.type == DioExceptionType.cancel || cancelToken?.isCancelled == true) {
           rethrow;
         }
+        final code = e.response?.statusCode;
+        failureReasons?.add(code != null ? 'HTTP $code ($userAgent)' : '${e.type.name} ($userAgent)');
         debugPrint('[BaiduProvider] Stream try failed ($currentUrl, $userAgent): $e');
         return null;
       } catch (e) {
+        failureReasons?.add(e.toString());
         debugPrint('[BaiduProvider] Stream try failed ($currentUrl, $userAgent): $e');
         return null;
       }

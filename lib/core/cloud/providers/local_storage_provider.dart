@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../cloud_item.dart';
 import '../cloud_storage_provider.dart';
@@ -155,14 +156,15 @@ class LocalStorageProvider implements CloudStorageProvider {
     final parent = (parentId.isEmpty || parentId == 'root')
         ? (await getApplicationDocumentsDirectory()).path
         : parentId;
-    final newPath = '$parent${Platform.pathSeparator}$folderName';
+    final safeName = _sanitizeFileName(folderName);
+    final newPath = p.join(parent, safeName);
     final dir = Directory(newPath);
     if (!await dir.exists()) {
       await dir.create(recursive: true);
     }
     return CloudItem(
       id: newPath,
-      name: folderName,
+      name: safeName,
       parentId: parent,
       path: newPath,
       isFolder: true,
@@ -198,11 +200,17 @@ class LocalStorageProvider implements CloudStorageProvider {
     return file.openRead(startByte, endByte);
   }
 
+  String _sanitizeFileName(String fileName) {
+    if (!Platform.isWindows) return fileName;
+    final sanitized = fileName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();
+    return sanitized.isEmpty ? 'unnamed_file' : sanitized;
+  }
+
   Future<File> _resolveDestFile(String parentId, String fileName) async {
     final parent = (parentId.isEmpty || parentId == 'root')
         ? (await getApplicationDocumentsDirectory()).path
         : parentId;
-    return File('$parent${Platform.pathSeparator}$fileName');
+    return File(p.join(parent, _sanitizeFileName(fileName)));
   }
 
   File _getPartFile(File destFile) => File('${destFile.path}.part');

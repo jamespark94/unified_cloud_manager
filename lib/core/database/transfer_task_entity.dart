@@ -35,6 +35,8 @@ enum TransferStatus {
 class TransferTask {
   final String id;
   final String? groupId;
+  final String? groupName;
+  final String? relativePath;
   final String providerType;
   final String sourceAccountId;
   final String destAccountId;
@@ -53,6 +55,8 @@ class TransferTask {
   const TransferTask({
     required this.id,
     this.groupId,
+    this.groupName,
+    this.relativePath,
     required this.providerType,
     required this.sourceAccountId,
     required this.destAccountId,
@@ -74,6 +78,8 @@ class TransferTask {
   TransferTask copyWith({
     String? id,
     String? groupId,
+    String? groupName,
+    String? relativePath,
     String? providerType,
     String? sourceAccountId,
     String? destAccountId,
@@ -92,6 +98,8 @@ class TransferTask {
     return TransferTask(
       id: id ?? this.id,
       groupId: groupId ?? this.groupId,
+      groupName: groupName ?? this.groupName,
+      relativePath: relativePath ?? this.relativePath,
       providerType: providerType ?? this.providerType,
       sourceAccountId: sourceAccountId ?? this.sourceAccountId,
       destAccountId: destAccountId ?? this.destAccountId,
@@ -112,6 +120,8 @@ class TransferTask {
   Map<String, dynamic> toMap() => {
         'id': id,
         'group_id': groupId,
+        'group_name': groupName,
+        'relative_path': relativePath,
         'provider_type': providerType,
         'source_account_id': sourceAccountId,
         'dest_account_id': destAccountId,
@@ -131,6 +141,8 @@ class TransferTask {
   factory TransferTask.fromMap(Map<String, dynamic> map) => TransferTask(
         id: map['id'] as String,
         groupId: map['group_id'] as String?,
+        groupName: map['group_name'] as String?,
+        relativePath: map['relative_path'] as String?,
         providerType: map['provider_type'] as String,
         sourceAccountId: map['source_account_id'] as String? ?? 'local',
         destAccountId: map['dest_account_id'] as String? ?? 'local',
