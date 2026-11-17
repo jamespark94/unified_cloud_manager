@@ -243,8 +243,11 @@ class TeraBoxProvider implements CloudStorageProvider {
     required String fileId,
     int? startByte,
     int? endByte,
+    CancelToken? cancelToken,
+    void Function(int actualStartByte)? onActualStartByte,
   }) async {
     if (account.accessToken.isEmpty) {
+      onActualStartByte?.call(0);
       return Stream.fromIterable([utf8.encode('Mock TeraBox Download Stream Content')]);
     }
 
@@ -353,6 +356,7 @@ class TeraBoxProvider implements CloudStorageProvider {
 
           final response = await _dio.get<ResponseBody>(
             url,
+            cancelToken: cancelToken,
             options: Options(
               headers: headers,
               responseType: ResponseType.stream,
@@ -365,9 +369,18 @@ class TeraBoxProvider implements CloudStorageProvider {
             // Content-Type 확인: json 응답(에러)이 아닐 때만 유효한 파일 바이너리로 판단
             final contentType = response.headers.value('content-type') ?? '';
             if (!contentType.contains('application/json')) {
+              onActualStartByte?.call(
+                resolveActualStartByte(
+                  statusCode: response.statusCode ?? 200,
+                  contentRangeHeader: response.headers.value('content-range'),
+                  requestedStartByte: startByte,
+                ),
+              );
               return response.data!.stream;
             }
           }
+        } on DioException catch (e) {
+          if (e.type == DioExceptionType.cancel) rethrow;
         } catch (e) {
           // try next
         }

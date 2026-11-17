@@ -147,8 +147,11 @@ class MegaProvider implements CloudStorageProvider {
     required String fileId,
     int? startByte,
     int? endByte,
+    CancelToken? cancelToken,
+    void Function(int actualStartByte)? onActualStartByte,
   }) async {
     if (account.accessToken.isEmpty) {
+      onActualStartByte?.call(0);
       return Stream.fromIterable([utf8.encode('Mock MEGA E2EE Download Stream Content')]);
     }
 
@@ -157,8 +160,10 @@ class MegaProvider implements CloudStorageProvider {
 
     final response = await Dio().get<ResponseBody>(
       downloadUrl,
+      cancelToken: cancelToken,
       options: Options(responseType: ResponseType.stream),
     );
+    onActualStartByte?.call(0);
     return response.data!.stream;
   }
 

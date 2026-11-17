@@ -105,12 +105,18 @@ class NaverBoxProvider implements CloudStorageProvider {
     required String fileId,
     int? startByte,
     int? endByte,
+    CancelToken? cancelToken,
+    void Function(int actualStartByte)? onActualStartByte,
   }) async {
     if (account.accessToken.isEmpty) {
+      onActualStartByte?.call(0);
       return Stream.fromIterable([utf8.encode('Mock Naver MYBOX File Content')]);
     }
 
-    final downloadUrlRes = await _dio.get('/v1/drive/files/$fileId/download');
+    final downloadUrlRes = await _dio.get(
+      '/v1/drive/files/$fileId/download',
+      cancelToken: cancelToken,
+    );
     final directUrl = downloadUrlRes.data['downloadUrl'] as String;
 
     final headers = <String, dynamic>{};
@@ -120,7 +126,15 @@ class NaverBoxProvider implements CloudStorageProvider {
 
     final response = await Dio().get<ResponseBody>(
       directUrl,
+      cancelToken: cancelToken,
       options: Options(headers: headers, responseType: ResponseType.stream),
+    );
+    onActualStartByte?.call(
+      resolveActualStartByte(
+        statusCode: response.statusCode ?? 200,
+        contentRangeHeader: response.headers.value('content-range'),
+        requestedStartByte: startByte,
+      ),
     );
     return response.data!.stream;
   }

@@ -171,6 +171,41 @@ class AppDatabase {
     );
   }
 
+  Future<TransferTask?> getTaskById(String id) async {
+    final db = await database;
+    final list = await db.query('transfer_tasks', where: 'id = ?', whereArgs: [id], limit: 1);
+    if (list.isEmpty) return null;
+    return TransferTask.fromMap(list.first);
+  }
+
+  Future<int> deleteMatchingPausedTasks(TransferTask task) async {
+    final db = await database;
+    return await db.delete(
+      'transfer_tasks',
+      where:
+          'status = ? AND source_account_id = ? AND source_path = ? AND dest_account_id = ? AND destination_path = ? AND file_name = ? AND id != ?',
+      whereArgs: [
+        TransferStatus.paused.name,
+        task.sourceAccountId,
+        task.sourcePath,
+        task.destAccountId,
+        task.destinationPath,
+        task.fileName,
+        task.id,
+      ],
+    );
+  }
+
+  Future<int> pauseAllPendingAndActiveTasks() async {
+    final db = await database;
+    return await db.update(
+      'transfer_tasks',
+      {'status': TransferStatus.paused.name, 'updated_at': DateTime.now().millisecondsSinceEpoch},
+      where: 'status IN (?, ?)',
+      whereArgs: [TransferStatus.pending.name, TransferStatus.active.name],
+    );
+  }
+
   Future<void> deleteTask(String id) async {
     final db = await database;
     await db.delete('transfer_tasks', where: 'id = ?', whereArgs: [id]);

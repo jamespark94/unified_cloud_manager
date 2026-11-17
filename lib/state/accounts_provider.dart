@@ -49,6 +49,9 @@ class AccountsNotifier extends StateNotifier<List<CloudAccount>> {
       final p = createProviderForAccount(acc);
       TransferQueueManager.instance.registerProvider(p);
     }
+
+    // Resume any pending/interrupted tasks once all providers are registered
+    TransferQueueManager.instance.processQueue();
   }
 
   Future<void> saveAccount(CloudAccount account) async {

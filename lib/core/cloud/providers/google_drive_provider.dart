@@ -120,8 +120,11 @@ class GoogleDriveProvider implements CloudStorageProvider {
     required String fileId,
     int? startByte,
     int? endByte,
+    CancelToken? cancelToken,
+    void Function(int actualStartByte)? onActualStartByte,
   }) async {
     if (account.accessToken.isEmpty) {
+      onActualStartByte?.call(0);
       return Stream.fromIterable([utf8.encode('Mock Google Drive File Content')]);
     }
 
@@ -133,9 +136,17 @@ class GoogleDriveProvider implements CloudStorageProvider {
 
     final response = await _dio.get<ResponseBody>(
       url,
+      cancelToken: cancelToken,
       options: Options(
         headers: headers,
         responseType: ResponseType.stream,
+      ),
+    );
+    onActualStartByte?.call(
+      resolveActualStartByte(
+        statusCode: response.statusCode ?? 200,
+        contentRangeHeader: response.headers.value('content-range'),
+        requestedStartByte: startByte,
       ),
     );
     return response.data!.stream;

@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import '../cloud_item.dart';
@@ -186,12 +187,82 @@ class LocalStorageProvider implements CloudStorageProvider {
     required String fileId,
     int? startByte,
     int? endByte,
+    CancelToken? cancelToken,
+    void Function(int actualStartByte)? onActualStartByte,
   }) async {
     final file = File(fileId);
     if (!await file.exists()) {
       throw Exception('로컬 파일을 찾을 수 없습니다: $fileId');
     }
+    onActualStartByte?.call(startByte ?? 0);
     return file.openRead(startByte, endByte);
+  }
+
+  Future<File> _resolveDestFile(String parentId, String fileName) async {
+    final parent = (parentId.isEmpty || parentId == 'root')
+        ? (await getApplicationDocumentsDirectory()).path
+        : parentId;
+    return File('$parent${Platform.pathSeparator}$fileName');
+  }
+
+  File _getPartFile(File destFile) => File('${destFile.path}.part');
+
+  /// Returns the number of contiguous bytes already saved in `.part` (or legacy partial target)
+  /// that can be safely resumed from.
+  Future<int> getResumableBytes({
+    required String parentId,
+    required String fileName,
+    required int expectedTotalBytes,
+    required int recordedTransferredBytes,
+  }) async {
+    final destFile = await _resolveDestFile(parentId, fileName);
+    final partFile = _getPartFile(destFile);
+
+    if (await partFile.exists()) {
+      final len = await partFile.length();
+      if (expectedTotalBytes > 0 && len > expectedTotalBytes) {
+        await partFile.delete();
+        return 0;
+      }
+      return len;
+    }
+
+    // Legacy migration: if a task paused before `.part` temp files were introduced,
+    // promote the incomplete destination file to `.part` so it can be resumed.
+    if (recordedTransferredBytes > 0 && await destFile.exists()) {
+      final destLen = await destFile.length();
+      if (destLen > 0 && (expectedTotalBytes == 0 || destLen < expectedTotalBytes)) {
+        await destFile.rename(partFile.path);
+        return destLen;
+      }
+    }
+
+    return 0;
+  }
+
+  Future<void> finalizePartialFile({
+    required String parentId,
+    required String fileName,
+  }) async {
+    final destFile = await _resolveDestFile(parentId, fileName);
+    final partFile = _getPartFile(destFile);
+    if (await partFile.exists()) {
+      if (await destFile.exists()) {
+        await destFile.delete();
+      }
+      await partFile.rename(destFile.path);
+    }
+  }
+
+  Future<void> deletePartialFile({
+    required String parentId,
+    required String fileName,
+  }) async {
+    final destFile = await _resolveDestFile(parentId, fileName);
+    final partFile = _getPartFile(destFile);
+    if (await partFile.exists()) {
+      await partFile.delete();
+    }
   }
 
   @override
@@ -201,23 +272,63 @@ class LocalStorageProvider implements CloudStorageProvider {
     required Stream<List<int>> stream,
     required int length,
     Function(int bytesSent, int totalBytes)? onProgress,
+    int startByte = 0,
+    bool Function()? shouldFinalize,
   }) async {
-    final parent = (parentId.isEmpty || parentId == 'root')
-        ? (await getApplicationDocumentsDirectory()).path
-        : parentId;
-    final destFile = File('$parent${Platform.pathSeparator}$fileName');
-    final sink = destFile.openWrite(mode: FileMode.writeOnly);
+    final destFile = await _resolveDestFile(parentId, fileName);
+    if (!await destFile.parent.exists()) {
+      await destFile.parent.create(recursive: true);
+    }
+    final partFile = _getPartFile(destFile);
 
-    int sent = 0;
+    final RandomAccessFile raf;
+    if (startByte <= 0) {
+      raf = await partFile.open(mode: FileMode.writeOnly);
+    } else {
+      if (!await partFile.exists()) {
+        throw Exception('이어받기 임시 파일을 찾을 수 없습니다: ${partFile.path}');
+      }
+      final currentLen = await partFile.length();
+      if (currentLen < startByte) {
+        throw Exception('이어받기 파일 크기가 일치하지 않습니다 ($currentLen < $startByte)');
+      }
+      if (currentLen > startByte) {
+        final trimRaf = await partFile.open(mode: FileMode.append);
+        try {
+          await trimRaf.truncate(startByte);
+        } finally {
+          await trimRaf.close();
+        }
+      }
+      raf = await partFile.open(mode: FileMode.writeOnlyAppend);
+    }
+
+    int totalWritten = startByte > 0 ? startByte : 0;
+    bool completedNormally = false;
     try {
       await for (final chunk in stream) {
-        sink.add(chunk);
-        sent += chunk.length;
-        onProgress?.call(sent, length);
+        if (shouldFinalize != null && !shouldFinalize()) {
+          break;
+        }
+        await raf.writeFrom(chunk);
+        totalWritten += chunk.length;
+        onProgress?.call(totalWritten, length);
       }
-      await sink.flush();
+      await raf.flush();
+      completedNormally =
+          (shouldFinalize?.call() ?? true) && (length == 0 || totalWritten >= length);
     } finally {
-      await sink.close();
+      try {
+        await raf.flush();
+      } catch (_) {}
+      await raf.close();
+    }
+
+    if (completedNormally) {
+      if (await destFile.exists()) {
+        await destFile.delete();
+      }
+      await partFile.rename(destFile.path);
     }
   }
 

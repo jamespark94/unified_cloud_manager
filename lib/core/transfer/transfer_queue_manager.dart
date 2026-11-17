@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:math';
+import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import '../cloud/cloud_storage_provider.dart';
+import '../cloud/providers/local_storage_provider.dart';
 import '../database/app_database.dart';
 import '../database/transfer_task_entity.dart';
 import '../utils/format_utils.dart';
@@ -23,6 +25,48 @@ class TaskProgressInfo {
   double get progress => totalBytes > 0 ? (transferredBytes / totalBytes).clamp(0.0, 1.0) : 0.0;
 }
 
+class _TransferAbortedException implements Exception {
+  final bool isCancelled;
+  const _TransferAbortedException({required this.isCancelled});
+}
+
+class _ActiveTransferControl {
+  final CancelToken cancelToken = CancelToken();
+  StreamSubscription<List<int>>? subscription;
+  StreamController<List<int>>? controller;
+  final Completer<void> finished = Completer<void>();
+  bool isPaused = false;
+  bool isCancelled = false;
+
+  Future<void> abort({required bool cancelled}) async {
+    if (cancelled) {
+      isCancelled = true;
+    } else {
+      isPaused = true;
+    }
+
+    if (!cancelToken.isCancelled) {
+      cancelToken.cancel(cancelled ? 'Task cancelled' : 'Task paused');
+    }
+
+    final sub = subscription;
+    subscription = null;
+    if (sub != null) {
+      try {
+        await sub.cancel();
+      } catch (_) {}
+    }
+
+    final ctrl = controller;
+    if (ctrl != null && !ctrl.isClosed) {
+      if (cancelled) {
+        ctrl.addError(_TransferAbortedException(isCancelled: true));
+      }
+      await ctrl.close();
+    }
+  }
+}
+
 class TransferQueueManager extends ChangeNotifier {
   static final TransferQueueManager instance = TransferQueueManager._();
   TransferQueueManager._();
@@ -33,7 +77,7 @@ class TransferQueueManager extends ChangeNotifier {
   int maxConcurrentTasks = 3;
   final Set<String> _activeTaskIds = {};
   final Set<String> _cancelledTaskIds = {};
-  final Map<String, StreamSubscription> _subscriptions = {};
+  final Map<String, _ActiveTransferControl> _activeControls = {};
 
   // Realtime granular task progress map (taskId -> TaskProgressInfo)
   final Map<String, TaskProgressInfo> _taskProgressMap = {};
@@ -61,12 +105,26 @@ class TransferQueueManager extends ChangeNotifier {
     // 1. Reset interrupted active tasks to pending
     await _db.resetInterruptedActiveTasks();
 
-    // 2. Start speed calculator loop (every 500ms)
+    // 2. Restore progress map so UI shows persisted transferredBytes immediately
+    final existingTasks = await _db.getAllTasks();
+    for (final task in existingTasks) {
+      _taskProgressMap[task.id] = TaskProgressInfo(
+        transferredBytes: task.transferredBytes,
+        totalBytes: task.totalBytes,
+        speedBytesPerSec: 0.0,
+        status: task.status,
+      );
+    }
+
+    // 3. Start speed calculator loop (every 500ms)
     _speedMeterTimer?.cancel();
     _speedMeterTimer = Timer.periodic(const Duration(milliseconds: 500), (_) => _calculateGlobalSpeed());
 
-    // 3. Trigger queue process
-    processQueue();
+    // 4. Only process immediately if providers are already registered;
+    // otherwise AccountsNotifier.loadAccounts() triggers processQueue() once ready.
+    if (_providers.isNotEmpty) {
+      processQueue();
+    }
   }
 
   void _calculateGlobalSpeed() {
@@ -97,6 +155,7 @@ class TransferQueueManager extends ChangeNotifier {
   }
 
   Future<void> enqueueTask(TransferTask task) async {
+    await _db.deleteMatchingPausedTasks(task);
     await _db.insertTask(task);
     _taskProgressMap[task.id] = TaskProgressInfo(
       transferredBytes: task.transferredBytes,
@@ -109,6 +168,9 @@ class TransferQueueManager extends ChangeNotifier {
   }
 
   Future<void> enqueueBatch(List<TransferTask> tasks) async {
+    for (final task in tasks) {
+      await _db.deleteMatchingPausedTasks(task);
+    }
     await _db.insertTasksBatch(tasks);
     for (final task in tasks) {
       _taskProgressMap[task.id] = TaskProgressInfo(
@@ -123,9 +185,7 @@ class TransferQueueManager extends ChangeNotifier {
   }
 
   Future<void> pauseTask(String taskId) async {
-    _subscriptions[taskId]?.cancel();
-    _subscriptions.remove(taskId);
-    _activeTaskIds.remove(taskId);
+    final control = _activeControls[taskId];
     if (_taskProgressMap.containsKey(taskId)) {
       final old = _taskProgressMap[taskId]!;
       _taskProgressMap[taskId] = TaskProgressInfo(
@@ -135,12 +195,26 @@ class TransferQueueManager extends ChangeNotifier {
         status: TransferStatus.paused,
       );
     }
+    notifyListeners();
+
+    if (control != null) {
+      await control.abort(cancelled: false);
+      await control.finished.future.timeout(const Duration(seconds: 5), onTimeout: () {});
+    }
+
+    _activeTaskIds.remove(taskId);
     await _db.updateTaskStatus(taskId, TransferStatus.paused);
+    if (_activeTaskIds.isEmpty) {
+      currentSpeedBytesPerSec = 0.0;
+      _lastCumulativeBytes = 0;
+      await BackgroundServiceManager.instance.stopServiceIfIdle();
+    }
     notifyListeners();
     processQueue();
   }
 
   Future<void> resumeTask(String taskId) async {
+    _cancelledTaskIds.remove(taskId);
     if (_taskProgressMap.containsKey(taskId)) {
       final old = _taskProgressMap[taskId]!;
       _taskProgressMap[taskId] = TaskProgressInfo(
@@ -157,10 +231,22 @@ class TransferQueueManager extends ChangeNotifier {
 
   Future<void> cancelTask(String taskId) async {
     _cancelledTaskIds.add(taskId);
-    _subscriptions[taskId]?.cancel();
-    _subscriptions.remove(taskId);
+    final task = await _db.getTaskById(taskId);
+    final control = _activeControls[taskId];
+
     _activeTaskIds.remove(taskId);
     _taskProgressMap.remove(taskId);
+    notifyListeners();
+
+    if (control != null) {
+      await control.abort(cancelled: true);
+      await control.finished.future.timeout(const Duration(seconds: 5), onTimeout: () {});
+    }
+
+    if (task != null) {
+      await _deleteLocalPartialFileForTask(task);
+    }
+
     await _db.deleteTask(taskId);
     if (_activeTaskIds.isEmpty) {
       currentSpeedBytesPerSec = 0.0;
@@ -173,19 +259,21 @@ class TransferQueueManager extends ChangeNotifier {
 
   Future<void> cancelAll() async {
     final dbTasks = await _db.getAllTasks();
-    for (final t in dbTasks) {
-      if (t.status == TransferStatus.pending ||
-          t.status == TransferStatus.active ||
-          t.status == TransferStatus.paused) {
-        _cancelledTaskIds.add(t.id);
-      }
+    final incompleteTasks = dbTasks
+        .where(
+          (t) =>
+              t.status == TransferStatus.pending ||
+              t.status == TransferStatus.active ||
+              t.status == TransferStatus.paused,
+        )
+        .toList();
+
+    for (final t in incompleteTasks) {
+      _cancelledTaskIds.add(t.id);
     }
     _cancelledTaskIds.addAll(_activeTaskIds);
 
-    for (final sub in _subscriptions.values) {
-      await sub.cancel();
-    }
-    _subscriptions.clear();
+    final controls = _activeControls.values.toList();
     _activeTaskIds.clear();
     _taskProgressMap.removeWhere(
       (_, p) =>
@@ -195,6 +283,16 @@ class TransferQueueManager extends ChangeNotifier {
     );
     currentSpeedBytesPerSec = 0.0;
     _lastCumulativeBytes = 0;
+    notifyListeners();
+
+    await Future.wait(controls.map((c) => c.abort(cancelled: true)));
+    await Future.wait(
+      controls.map((c) => c.finished.future.timeout(const Duration(seconds: 5), onTimeout: () {})),
+    );
+
+    for (final t in incompleteTasks) {
+      await _deleteLocalPartialFileForTask(t);
+    }
 
     await _db.cancelIncompleteTasks();
     await BackgroundServiceManager.instance.stopServiceIfIdle();
@@ -202,16 +300,47 @@ class TransferQueueManager extends ChangeNotifier {
   }
 
   Future<void> pauseAll() async {
-    for (final id in _activeTaskIds.toList()) {
-      await pauseTask(id);
+    await _db.pauseAllPendingAndActiveTasks();
+    for (final entry in _taskProgressMap.entries.toList()) {
+      if (entry.value.status == TransferStatus.active ||
+          entry.value.status == TransferStatus.pending) {
+        _taskProgressMap[entry.key] = TaskProgressInfo(
+          transferredBytes: entry.value.transferredBytes,
+          totalBytes: entry.value.totalBytes,
+          speedBytesPerSec: 0,
+          status: TransferStatus.paused,
+        );
+      }
     }
+    notifyListeners();
+
+    final controls = _activeControls.values.toList();
+    await Future.wait(controls.map((c) => c.abort(cancelled: false)));
+    await Future.wait(
+      controls.map((c) => c.finished.future.timeout(const Duration(seconds: 5), onTimeout: () {})),
+    );
+    _activeTaskIds.clear();
+    currentSpeedBytesPerSec = 0.0;
+    _lastCumulativeBytes = 0;
+    await BackgroundServiceManager.instance.stopServiceIfIdle();
+    notifyListeners();
   }
 
   Future<void> resumeAll() async {
     final tasks = await _db.getAllTasks();
     for (final t in tasks) {
       if (t.status == TransferStatus.paused) {
+        _cancelledTaskIds.remove(t.id);
         await _db.updateTaskStatus(t.id, TransferStatus.pending);
+        if (_taskProgressMap.containsKey(t.id)) {
+          final old = _taskProgressMap[t.id]!;
+          _taskProgressMap[t.id] = TaskProgressInfo(
+            transferredBytes: old.transferredBytes,
+            totalBytes: old.totalBytes,
+            speedBytesPerSec: 0,
+            status: TransferStatus.pending,
+          );
+        }
       }
     }
     notifyListeners();
@@ -224,6 +353,20 @@ class TransferQueueManager extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _deleteLocalPartialFileForTask(TransferTask task) async {
+    final dstProvider = _providers[task.destAccountId];
+    if (dstProvider is LocalStorageProvider) {
+      try {
+        await dstProvider.deletePartialFile(
+          parentId: task.destinationPath,
+          fileName: task.fileName,
+        );
+      } catch (e) {
+        debugPrint('[TransferQueue] Failed to delete partial file for ${task.fileName}: $e');
+      }
+    }
+  }
+
   /// 큐 처리 메인 루프 (최대 3개 동시 실행)
   Future<void> processQueue() async {
     if (_isProcessing) return;
@@ -233,10 +376,10 @@ class TransferQueueManager extends ChangeNotifier {
       while (_activeTaskIds.length < maxConcurrentTasks) {
         final nextTask = await _db.getNextPendingTask();
         if (nextTask == null) break;
-
         if (_activeTaskIds.contains(nextTask.id)) break;
 
         _activeTaskIds.add(nextTask.id);
+        await _db.updateTaskStatus(nextTask.id, TransferStatus.active);
         await BackgroundServiceManager.instance.startServiceIfNeeded();
         _executeTask(nextTask);
       }
@@ -251,40 +394,133 @@ class TransferQueueManager extends ChangeNotifier {
 
   Future<void> _executeTask(TransferTask task) async {
     _cancelledTaskIds.remove(task.id);
-    await _db.updateTaskStatus(task.id, TransferStatus.active);
-    if (_cancelledTaskIds.contains(task.id)) return;
-    _taskProgressMap[task.id] = TaskProgressInfo(
-      transferredBytes: task.transferredBytes,
-      totalBytes: task.totalBytes,
-      speedBytesPerSec: 0.0,
-      status: TransferStatus.active,
-    );
-    notifyListeners();
+    final control = _ActiveTransferControl();
+    _activeControls[task.id] = control;
 
-    final srcProvider = _providers[task.sourceAccountId];
-    final dstProvider = _providers[task.destAccountId];
-
-    if (srcProvider == null || dstProvider == null) {
-      await _failTask(task, '스토리지 제공자를 찾을 수 없습니다.');
-      return;
-    }
+    int transferred = task.transferredBytes;
+    int total = task.totalBytes;
 
     try {
-      int transferred = task.transferredBytes;
-      int total = task.totalBytes;
-      int lastTaskBytes = transferred;
+      if (_cancelledTaskIds.contains(task.id) || control.isCancelled || control.isPaused) {
+        return;
+      }
+
+      _taskProgressMap[task.id] = TaskProgressInfo(
+        transferredBytes: transferred,
+        totalBytes: total,
+        speedBytesPerSec: 0.0,
+        status: TransferStatus.active,
+      );
+      notifyListeners();
+
+      final srcProvider = _providers[task.sourceAccountId];
+      final dstProvider = _providers[task.destAccountId];
+
+      if (srcProvider == null || dstProvider == null) {
+        await _failTask(task, '스토리지 제공자를 찾을 수 없습니다.');
+        return;
+      }
+
+      int existingBytes = 0;
+      if (dstProvider is LocalStorageProvider) {
+        existingBytes = await dstProvider.getResumableBytes(
+          parentId: task.destinationPath,
+          fileName: task.fileName,
+          expectedTotalBytes: total,
+          recordedTransferredBytes: task.transferredBytes,
+        );
+        if (control.isCancelled || control.isPaused || _cancelledTaskIds.contains(task.id)) {
+          return;
+        }
+        if (total > 0 && existingBytes == total) {
+          await dstProvider.finalizePartialFile(
+            parentId: task.destinationPath,
+            fileName: task.fileName,
+          );
+          await _markCompleted(task, total, total);
+          return;
+        }
+      }
+
+      int actualStartByte = 0;
+      final rawStream = await srcProvider.downloadStream(
+        fileId: task.sourcePath,
+        startByte: existingBytes > 0 ? existingBytes : null,
+        cancelToken: control.cancelToken,
+        onActualStartByte: (offset) {
+          actualStartByte = offset;
+        },
+      );
+
+      if (control.isCancelled || control.isPaused || _cancelledTaskIds.contains(task.id)) {
+        await _drainCancelStream(rawStream);
+        return;
+      }
+
+      transferred = actualStartByte;
+      int lastTaskBytes = actualStartByte;
       DateTime lastSpeedTime = DateTime.now();
       DateTime lastDbWriteTime = DateTime.now();
 
-      final stream = await srcProvider.downloadStream(
-        fileId: task.sourcePath,
-        startByte: transferred > 0 ? transferred : null,
+      if (transferred != task.transferredBytes) {
+        _taskProgressMap[task.id] = TaskProgressInfo(
+          transferredBytes: transferred,
+          totalBytes: total,
+          speedBytesPerSec: 0.0,
+          status: TransferStatus.active,
+        );
+        await _db.updateTaskProgress(
+          id: task.id,
+          transferredBytes: transferred,
+          totalBytes: total,
+          status: TransferStatus.active,
+        );
+        notifyListeners();
+      }
+
+      if (control.isCancelled || control.isPaused || _cancelledTaskIds.contains(task.id)) {
+        await _drainCancelStream(rawStream);
+        return;
+      }
+
+      late final StreamController<List<int>> controller;
+      controller = StreamController<List<int>>(
+        onPause: () => control.subscription?.pause(),
+        onResume: () => control.subscription?.resume(),
+        onCancel: () async {
+          final sub = control.subscription;
+          control.subscription = null;
+          if (sub != null) {
+            await sub.cancel();
+          }
+        },
       );
-      if (_cancelledTaskIds.contains(task.id)) return;
+      control.controller = controller;
+      control.subscription = rawStream.listen(
+        (chunk) {
+          if (!controller.isClosed) {
+            controller.add(chunk);
+          }
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          if (!controller.isClosed) {
+            controller.addError(error, stackTrace);
+            controller.close();
+          }
+        },
+        onDone: () {
+          if (!controller.isClosed) {
+            controller.close();
+          }
+        },
+        cancelOnError: true,
+      );
 
       // Throttled progress callback
       void onProgress(int bytesSent, int totalBytes) {
-        if (_cancelledTaskIds.contains(task.id)) return;
+        if (control.isCancelled || control.isPaused || _cancelledTaskIds.contains(task.id)) {
+          return;
+        }
         transferred = bytesSent;
         if (totalBytes > 0) total = totalBytes;
 
@@ -324,38 +560,58 @@ class TransferQueueManager extends ChangeNotifier {
         notifyListeners();
       }
 
-      await dstProvider.uploadStream(
-        parentId: task.destinationPath,
-        fileName: task.fileName,
-        stream: stream,
-        length: total > 0 ? total : 0,
-        onProgress: onProgress,
-      );
-      if (_cancelledTaskIds.contains(task.id)) return;
+      if (dstProvider is LocalStorageProvider) {
+        await dstProvider.uploadStream(
+          parentId: task.destinationPath,
+          fileName: task.fileName,
+          stream: controller.stream,
+          length: total > 0 ? total : 0,
+          onProgress: onProgress,
+          startByte: actualStartByte,
+          shouldFinalize: () => !control.isCancelled && !control.isPaused,
+        );
+      } else {
+        await dstProvider.uploadStream(
+          parentId: task.destinationPath,
+          fileName: task.fileName,
+          stream: controller.stream,
+          length: total > 0 ? total : 0,
+          onProgress: onProgress,
+        );
+      }
 
-      // Mark completed
-      await _db.updateTaskProgress(
-        id: task.id,
-        transferredBytes: total > 0 ? total : transferred,
-        totalBytes: total > 0 ? total : transferred,
-        status: TransferStatus.completed,
-      );
+      if (control.isCancelled || _cancelledTaskIds.contains(task.id)) return;
 
-      _taskProgressMap[task.id] = TaskProgressInfo(
-        transferredBytes: total > 0 ? total : transferred,
-        totalBytes: total > 0 ? total : transferred,
-        speedBytesPerSec: 0.0,
-        status: TransferStatus.completed,
-      );
+      if (control.isPaused) {
+        await _savePausedState(task.id, transferred, total);
+        return;
+      }
 
-      _activeTaskIds.remove(task.id);
-      notifyListeners();
-      processQueue();
+      if (total > 0 && transferred < total) {
+        throw Exception(
+          '전송이 불완전하게 종료되었습니다 ($transferred / $total bytes)',
+        );
+      }
+
+      await _markCompleted(task, total, transferred);
     } catch (e) {
-      if (_cancelledTaskIds.contains(task.id)) return;
+      if (control.isCancelled || _cancelledTaskIds.contains(task.id)) {
+        return;
+      }
+      if (control.isPaused) {
+        await _savePausedState(task.id, transferred, total);
+        return;
+      }
       debugPrint('[TransferQueue] Error on task ${task.id}: $e');
       if (task.retryCount < 5) {
         final backoffDelay = pow(2, task.retryCount) as int;
+        await _db.updateTaskProgress(
+          id: task.id,
+          transferredBytes: transferred,
+          totalBytes: total,
+          status: TransferStatus.pending,
+          errorMessage: '일시적 오류: $e ($backoffDelay초 후 재시도)',
+        );
         await _db.updateTaskStatus(
           task.id,
           TransferStatus.pending,
@@ -363,8 +619,8 @@ class TransferQueueManager extends ChangeNotifier {
           retryCount: task.retryCount + 1,
         );
         _taskProgressMap[task.id] = TaskProgressInfo(
-          transferredBytes: task.transferredBytes,
-          totalBytes: task.totalBytes,
+          transferredBytes: transferred,
+          totalBytes: total,
           speedBytesPerSec: 0.0,
           status: TransferStatus.pending,
         );
@@ -372,9 +628,70 @@ class TransferQueueManager extends ChangeNotifier {
         notifyListeners();
         Future.delayed(Duration(seconds: backoffDelay), () => processQueue());
       } else {
-        await _failTask(task, e.toString());
+        await _failTask(task.copyWith(transferredBytes: transferred, totalBytes: total), e.toString());
       }
+    } finally {
+      final sub = control.subscription;
+      control.subscription = null;
+      if (sub != null) {
+        try {
+          await sub.cancel();
+        } catch (_) {}
+      }
+      final ctrl = control.controller;
+      if (ctrl != null && !ctrl.isClosed) {
+        try {
+          await ctrl.close();
+        } catch (_) {}
+      }
+      _activeControls.remove(task.id);
+      _activeTaskIds.remove(task.id);
+      if (!control.finished.isCompleted) {
+        control.finished.complete();
+      }
+      notifyListeners();
     }
+  }
+
+  Future<void> _drainCancelStream(Stream<List<int>> stream) async {
+    try {
+      final sub = stream.listen((_) {}, onError: (_) {});
+      await sub.cancel();
+    } catch (_) {}
+  }
+
+  Future<void> _savePausedState(String taskId, int transferred, int total) async {
+    await _db.updateTaskProgress(
+      id: taskId,
+      transferredBytes: transferred,
+      totalBytes: total,
+      status: TransferStatus.paused,
+    );
+    _taskProgressMap[taskId] = TaskProgressInfo(
+      transferredBytes: transferred,
+      totalBytes: total,
+      speedBytesPerSec: 0.0,
+      status: TransferStatus.paused,
+    );
+  }
+
+  Future<void> _markCompleted(TransferTask task, int total, int transferred) async {
+    final finalBytes = total > 0 ? total : transferred;
+    await _db.updateTaskProgress(
+      id: task.id,
+      transferredBytes: finalBytes,
+      totalBytes: finalBytes,
+      status: TransferStatus.completed,
+    );
+    _taskProgressMap[task.id] = TaskProgressInfo(
+      transferredBytes: finalBytes,
+      totalBytes: finalBytes,
+      speedBytesPerSec: 0.0,
+      status: TransferStatus.completed,
+    );
+    _activeTaskIds.remove(task.id);
+    notifyListeners();
+    processQueue();
   }
 
   Future<void> _failTask(TransferTask task, String error) async {
@@ -385,7 +702,13 @@ class TransferQueueManager extends ChangeNotifier {
       speedBytesPerSec: 0.0,
       status: TransferStatus.failed,
     );
-    await _db.updateTaskStatus(task.id, TransferStatus.failed, errorMessage: error);
+    await _db.updateTaskProgress(
+      id: task.id,
+      transferredBytes: task.transferredBytes,
+      totalBytes: task.totalBytes,
+      status: TransferStatus.failed,
+      errorMessage: error,
+    );
     notifyListeners();
     processQueue();
   }
