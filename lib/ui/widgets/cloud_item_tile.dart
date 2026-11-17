@@ -4,11 +4,23 @@ import '../../core/cloud/cloud_item.dart';
 import '../../core/utils/format_utils.dart';
 import '../../core/utils/sort_utils.dart';
 
+enum CloudItemMenuAction {
+  open,
+  select,
+  transfer,
+  details,
+  delete,
+}
+
 class CloudItemTile extends StatelessWidget {
   final CloudItem item;
   final bool isSelected;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
+  final VoidCallback? onOpen;
+  final VoidCallback? onSelect;
+  final VoidCallback? onTransfer;
+  final VoidCallback? onDetails;
   final VoidCallback? onDelete;
 
   const CloudItemTile({
@@ -17,8 +29,19 @@ class CloudItemTile extends StatelessWidget {
     this.isSelected = false,
     required this.onTap,
     required this.onLongPress,
+    this.onOpen,
+    this.onSelect,
+    this.onTransfer,
+    this.onDetails,
     this.onDelete,
   });
+
+  bool get _hasMenuActions =>
+      (item.isFolder && onOpen != null) ||
+      onSelect != null ||
+      onTransfer != null ||
+      onDetails != null ||
+      onDelete != null;
 
   @override
   Widget build(BuildContext context) {
@@ -52,10 +75,92 @@ class CloudItemTile extends StatelessWidget {
               ),
         trailing: isSelected
             ? const Icon(Icons.check_circle, color: Colors.blueAccent, size: 20)
-            : onDelete != null
-                ? IconButton(
+            : _hasMenuActions
+                ? PopupMenuButton<CloudItemMenuAction>(
                     icon: const Icon(Icons.more_vert, size: 18, color: Colors.white54),
-                    onPressed: onDelete,
+                    tooltip: '작업 선택',
+                    onSelected: (action) {
+                      switch (action) {
+                        case CloudItemMenuAction.open:
+                          onOpen?.call();
+                          break;
+                        case CloudItemMenuAction.select:
+                          onSelect?.call();
+                          break;
+                        case CloudItemMenuAction.transfer:
+                          onTransfer?.call();
+                          break;
+                        case CloudItemMenuAction.details:
+                          onDetails?.call();
+                          break;
+                        case CloudItemMenuAction.delete:
+                          onDelete?.call();
+                          break;
+                      }
+                    },
+                    itemBuilder: (context) => [
+                      if (item.isFolder && onOpen != null)
+                        const PopupMenuItem<CloudItemMenuAction>(
+                          value: CloudItemMenuAction.open,
+                          child: Row(
+                            children: [
+                              Icon(Icons.folder_open_outlined, size: 18, color: Colors.amber),
+                              SizedBox(width: 10),
+                              Text('열기'),
+                            ],
+                          ),
+                        ),
+                      if (onTransfer != null)
+                        const PopupMenuItem<CloudItemMenuAction>(
+                          value: CloudItemMenuAction.transfer,
+                          child: Row(
+                            children: [
+                              Icon(Icons.send_rounded, size: 18, color: Colors.blueAccent),
+                              SizedBox(width: 10),
+                              Text('전송하기 (다운로드/복사)'),
+                            ],
+                          ),
+                        ),
+                      if (onSelect != null)
+                        const PopupMenuItem<CloudItemMenuAction>(
+                          value: CloudItemMenuAction.select,
+                          child: Row(
+                            children: [
+                              Icon(Icons.check_circle_outline, size: 18, color: Colors.white70),
+                              SizedBox(width: 10),
+                              Text('선택'),
+                            ],
+                          ),
+                        ),
+                      if (onDetails != null)
+                        const PopupMenuItem<CloudItemMenuAction>(
+                          value: CloudItemMenuAction.details,
+                          child: Row(
+                            children: [
+                              Icon(Icons.info_outline, size: 18, color: Colors.white70),
+                              SizedBox(width: 10),
+                              Text('상세 정보'),
+                            ],
+                          ),
+                        ),
+                      if (onDelete != null) ...[
+                        if ((item.isFolder && onOpen != null) ||
+                            onTransfer != null ||
+                            onSelect != null ||
+                            onDetails != null)
+                          const PopupMenuDivider(),
+                        const PopupMenuItem<CloudItemMenuAction>(
+                          value: CloudItemMenuAction.delete,
+                          child: Row(
+                            children: [
+                              Icon(Icons.delete_outline, size: 18, color: Colors.redAccent),
+                              SizedBox(width: 10),
+                              Text('삭제', style: TextStyle(color: Colors.redAccent)),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ],
                   )
                 : null,
       ),

@@ -3,11 +3,13 @@ import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/cloud/cloud_credentials.dart';
 import '../../core/cloud/cloud_item.dart';
 import '../../core/database/transfer_task_entity.dart';
 import '../../core/transfer/recursive_folder_handler.dart';
+import '../../core/utils/format_utils.dart';
 import '../../core/utils/sort_utils.dart';
 import '../../state/accounts_provider.dart';
 import '../../state/transfer_queue_provider.dart';
@@ -295,6 +297,80 @@ class _ExplorerTabViewState extends ConsumerState<ExplorerTabView> {
     }
   }
 
+  Future<void> _showItemDetails(CloudItem item) async {
+    final typeLabel = item.isFolder ? '폴더' : SortUtils.getCloudItemTypeLabel(item);
+    final sizeLabel = item.isFolder
+        ? '-'
+        : (item.size != null ? '${FormatUtils.formatBytes(item.size!)} (${item.size} B)' : '크기 미상');
+    final modifiedLabel = item.modifiedTime != null
+        ? DateFormat('yyyy-MM-dd HH:mm:ss').format(item.modifiedTime!)
+        : '정보 없음';
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(
+              item.isFolder ? Icons.folder_rounded : Icons.insert_drive_file_outlined,
+              color: item.isFolder ? Colors.amber : Colors.blueAccent,
+            ),
+            const SizedBox(width: 8),
+            const Expanded(
+              child: Text('상세 정보', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildDetailRow('이름', item.name),
+            _buildDetailRow('유형', typeLabel),
+            if (!item.isFolder) _buildDetailRow('크기', sizeLabel),
+            _buildDetailRow('수정 일시', modifiedLabel),
+            _buildDetailRow('저장소', '${widget.account.name} (${item.providerType.displayName})'),
+            _buildDetailRow('경로 / ID', item.path ?? item.id),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('닫기')),
+          if (widget.onRequestTransfer != null)
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+              onPressed: () {
+                Navigator.pop(ctx);
+                widget.onRequestTransfer?.call([item], widget.account);
+              },
+              icon: const Icon(Icons.send_rounded, size: 16, color: Colors.white),
+              label: const Text('전송하기', style: TextStyle(color: Colors.white)),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDetailRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 72,
+            child: Text(label, style: const TextStyle(fontSize: 12, color: Colors.white54)),
+          ),
+          Expanded(
+            child: SelectableText(
+              value,
+              style: const TextStyle(fontSize: 12, color: Colors.white),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return DropTarget(
@@ -408,6 +484,12 @@ class _ExplorerTabViewState extends ConsumerState<ExplorerTabView> {
                                       }
                                     },
                                     onLongPress: () => _toggleSelection(item),
+                                    onOpen: item.isFolder ? () => _navigateToFolder(item) : null,
+                                    onSelect: () => _toggleSelection(item),
+                                    onTransfer: widget.onRequestTransfer != null
+                                        ? () => widget.onRequestTransfer!([item], widget.account)
+                                        : null,
+                                    onDetails: () => _showItemDetails(item),
                                     onDelete: () => _confirmDelete(item),
                                   );
                                 },
@@ -416,31 +498,34 @@ class _ExplorerTabViewState extends ConsumerState<ExplorerTabView> {
 
               // Bottom Selection Action Bar
               if (_selectedItemIds.isNotEmpty)
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                  color: const Color(0xFF1F293D),
-                  child: Row(
-                    children: [
-                      Text(
-                        '${_selectedItemIds.length}개 선택됨',
-                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                      ),
-                      const Spacer(),
-                      TextButton(
-                        onPressed: () => setState(() => _selectedItemIds.clear()),
-                        child: const Text('선택 해제'),
-                      ),
-                      const SizedBox(width: 8),
-                      ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
-                        onPressed: () {
-                          final selected = _items.where((i) => _selectedItemIds.contains(i.id)).toList();
-                          widget.onRequestTransfer?.call(selected, widget.account);
-                        },
-                        icon: const Icon(Icons.send_rounded, size: 16, color: Colors.white),
-                        label: const Text('전송하기', style: TextStyle(color: Colors.white)),
-                      ),
-                    ],
+                SafeArea(
+                  top: false,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    color: const Color(0xFF1F293D),
+                    child: Row(
+                      children: [
+                        Text(
+                          '${_selectedItemIds.length}개 선택됨',
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                        ),
+                        const Spacer(),
+                        TextButton(
+                          onPressed: () => setState(() => _selectedItemIds.clear()),
+                          child: const Text('선택 해제'),
+                        ),
+                        const SizedBox(width: 8),
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+                          onPressed: () {
+                            final selected = _items.where((i) => _selectedItemIds.contains(i.id)).toList();
+                            widget.onRequestTransfer?.call(selected, widget.account);
+                          },
+                          icon: const Icon(Icons.send_rounded, size: 16, color: Colors.white),
+                          label: const Text('전송하기', style: TextStyle(color: Colors.white)),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
             ],

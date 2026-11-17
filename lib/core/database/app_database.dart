@@ -17,6 +17,45 @@ class AppDatabase {
     return _db!;
   }
 
+  @visibleForTesting
+  Future<void> initInMemoryForTest() async {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+    await _db?.close();
+    _db = await openDatabase(
+      inMemoryDatabasePath,
+      version: 1,
+      onCreate: _onCreate,
+    );
+  }
+
+  Future<void> _onCreate(Database db, int version) async {
+    await db.execute('''
+      CREATE TABLE transfer_tasks (
+        id TEXT PRIMARY KEY,
+        group_id TEXT,
+        provider_type TEXT NOT NULL,
+        source_account_id TEXT NOT NULL,
+        dest_account_id TEXT NOT NULL,
+        task_type TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        destination_path TEXT NOT NULL,
+        total_bytes INTEGER NOT NULL DEFAULT 0,
+        transferred_bytes INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        error_message TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE INDEX idx_tasks_status ON transfer_tasks (status, created_at)
+    ''');
+  }
+
   Future<Database> _initDb() async {
     if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
       sqfliteFfiInit();
@@ -27,32 +66,7 @@ class AppDatabase {
     return await openDatabase(
       dbPath,
       version: 1,
-      onCreate: (db, version) async {
-        await db.execute('''
-          CREATE TABLE transfer_tasks (
-            id TEXT PRIMARY KEY,
-            group_id TEXT,
-            provider_type TEXT NOT NULL,
-            source_account_id TEXT NOT NULL,
-            dest_account_id TEXT NOT NULL,
-            task_type TEXT NOT NULL,
-            file_name TEXT NOT NULL,
-            source_path TEXT NOT NULL,
-            destination_path TEXT NOT NULL,
-            total_bytes INTEGER NOT NULL DEFAULT 0,
-            transferred_bytes INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL,
-            retry_count INTEGER NOT NULL DEFAULT 0,
-            error_message TEXT,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-          )
-        ''');
-
-        await db.execute('''
-          CREATE INDEX idx_tasks_status ON transfer_tasks (status, created_at)
-        ''');
-      },
+      onCreate: _onCreate,
     );
   }
 
@@ -168,6 +182,19 @@ class AppDatabase {
       'transfer_tasks',
       where: 'status IN (?, ?)',
       whereArgs: [TransferStatus.completed.name, TransferStatus.failed.name],
+    );
+  }
+
+  Future<void> cancelIncompleteTasks() async {
+    final db = await database;
+    await db.delete(
+      'transfer_tasks',
+      where: 'status IN (?, ?, ?)',
+      whereArgs: [
+        TransferStatus.pending.name,
+        TransferStatus.active.name,
+        TransferStatus.paused.name,
+      ],
     );
   }
 }

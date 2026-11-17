@@ -32,6 +32,7 @@ class TransferQueueManager extends ChangeNotifier {
 
   int maxConcurrentTasks = 3;
   final Set<String> _activeTaskIds = {};
+  final Set<String> _cancelledTaskIds = {};
   final Map<String, StreamSubscription> _subscriptions = {};
 
   // Realtime granular task progress map (taskId -> TaskProgressInfo)
@@ -155,13 +156,49 @@ class TransferQueueManager extends ChangeNotifier {
   }
 
   Future<void> cancelTask(String taskId) async {
+    _cancelledTaskIds.add(taskId);
     _subscriptions[taskId]?.cancel();
     _subscriptions.remove(taskId);
     _activeTaskIds.remove(taskId);
     _taskProgressMap.remove(taskId);
     await _db.deleteTask(taskId);
+    if (_activeTaskIds.isEmpty) {
+      currentSpeedBytesPerSec = 0.0;
+      _lastCumulativeBytes = 0;
+      await BackgroundServiceManager.instance.stopServiceIfIdle();
+    }
     notifyListeners();
     processQueue();
+  }
+
+  Future<void> cancelAll() async {
+    final dbTasks = await _db.getAllTasks();
+    for (final t in dbTasks) {
+      if (t.status == TransferStatus.pending ||
+          t.status == TransferStatus.active ||
+          t.status == TransferStatus.paused) {
+        _cancelledTaskIds.add(t.id);
+      }
+    }
+    _cancelledTaskIds.addAll(_activeTaskIds);
+
+    for (final sub in _subscriptions.values) {
+      await sub.cancel();
+    }
+    _subscriptions.clear();
+    _activeTaskIds.clear();
+    _taskProgressMap.removeWhere(
+      (_, p) =>
+          p.status == TransferStatus.pending ||
+          p.status == TransferStatus.active ||
+          p.status == TransferStatus.paused,
+    );
+    currentSpeedBytesPerSec = 0.0;
+    _lastCumulativeBytes = 0;
+
+    await _db.cancelIncompleteTasks();
+    await BackgroundServiceManager.instance.stopServiceIfIdle();
+    notifyListeners();
   }
 
   Future<void> pauseAll() async {
@@ -213,7 +250,9 @@ class TransferQueueManager extends ChangeNotifier {
   }
 
   Future<void> _executeTask(TransferTask task) async {
+    _cancelledTaskIds.remove(task.id);
     await _db.updateTaskStatus(task.id, TransferStatus.active);
+    if (_cancelledTaskIds.contains(task.id)) return;
     _taskProgressMap[task.id] = TaskProgressInfo(
       transferredBytes: task.transferredBytes,
       totalBytes: task.totalBytes,
@@ -241,9 +280,11 @@ class TransferQueueManager extends ChangeNotifier {
         fileId: task.sourcePath,
         startByte: transferred > 0 ? transferred : null,
       );
+      if (_cancelledTaskIds.contains(task.id)) return;
 
       // Throttled progress callback
       void onProgress(int bytesSent, int totalBytes) {
+        if (_cancelledTaskIds.contains(task.id)) return;
         transferred = bytesSent;
         if (totalBytes > 0) total = totalBytes;
 
@@ -290,6 +331,7 @@ class TransferQueueManager extends ChangeNotifier {
         length: total > 0 ? total : 0,
         onProgress: onProgress,
       );
+      if (_cancelledTaskIds.contains(task.id)) return;
 
       // Mark completed
       await _db.updateTaskProgress(
@@ -310,6 +352,7 @@ class TransferQueueManager extends ChangeNotifier {
       notifyListeners();
       processQueue();
     } catch (e) {
+      if (_cancelledTaskIds.contains(task.id)) return;
       debugPrint('[TransferQueue] Error on task ${task.id}: $e');
       if (task.retryCount < 5) {
         final backoffDelay = pow(2, task.retryCount) as int;

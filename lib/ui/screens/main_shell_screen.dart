@@ -263,22 +263,25 @@ class _MainShellScreenState extends ConsumerState<MainShellScreen> with SingleTi
           }).toList(),
         ),
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: TabBarView(
-              controller: _tabController,
-              children: accounts.map((acc) {
-                return ExplorerTabView(
-                  account: acc,
-                  onRequestTransfer: _handleTransferRequest,
-                  onRemoveAccount: () => _confirmRemoveAccount(acc),
-                );
-              }).toList(),
+      body: SafeArea(
+        top: false,
+        child: Column(
+          children: [
+            Expanded(
+              child: TabBarView(
+                controller: _tabController,
+                children: accounts.map((acc) {
+                  return ExplorerTabView(
+                    account: acc,
+                    onRequestTransfer: _handleTransferRequest,
+                    onRemoveAccount: () => _confirmRemoveAccount(acc),
+                  );
+                }).toList(),
+              ),
             ),
-          ),
-          if (activeCount > 0) _buildMiniTransferBar(queueMgr, activeCount),
-        ],
+            if (activeCount > 0) _buildMiniTransferBar(queueMgr, activeCount),
+          ],
+        ),
       ),
     );
   }
