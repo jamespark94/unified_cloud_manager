@@ -9,7 +9,12 @@ import '../cloud_storage_provider.dart';
 class TeraBoxProvider implements CloudStorageProvider {
   final CloudAccount account;
   final Future<void> Function(CloudAccount)? onAccountUpdated;
-  final Dio _dio = Dio();
+  final Dio _dio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 15),
+      receiveTimeout: const Duration(seconds: 30),
+    ),
+  );
 
   static const String appId = '250528';
   static const String pcUserAgent =
@@ -366,21 +371,34 @@ class TeraBoxProvider implements CloudStorageProvider {
           );
 
           if (response.statusCode == 200 || response.statusCode == 206) {
-            // Content-Type 확인: json 응답(에러)이 아닐 때만 유효한 파일 바이너리로 판단
-            final contentType = response.headers.value('content-type') ?? '';
-            if (!contentType.contains('application/json')) {
-              onActualStartByte?.call(
-                resolveActualStartByte(
-                  statusCode: response.statusCode ?? 200,
-                  contentRangeHeader: response.headers.value('content-range'),
-                  requestedStartByte: startByte,
-                ),
-              );
-              return response.data!.stream;
+            final contentType = (response.headers.value('content-type') ?? '').toLowerCase();
+            final contentDisposition = (response.headers.value('content-disposition') ?? '').toLowerCase();
+            final isAttachment = contentDisposition.contains('attachment');
+            final isErrorType = !isAttachment &&
+                (contentType.contains('application/json') ||
+                    contentType.contains('text/html') ||
+                    contentType.contains('text/xml'));
+            if (isErrorType) {
+              await _cancelStream(response.data?.stream);
+              continue;
             }
+            final actualStart = resolveActualStartByte(
+              statusCode: response.statusCode ?? 200,
+              contentRangeHeader: response.headers.value('content-range'),
+              requestedStartByte: startByte,
+            );
+            if (startByte != null && actualStart > startByte) {
+              await _cancelStream(response.data?.stream);
+              continue;
+            }
+            onActualStartByte?.call(actualStart);
+            return response.data!.stream;
           }
+          await _cancelStream(response.data?.stream);
         } on DioException catch (e) {
-          if (e.type == DioExceptionType.cancel) rethrow;
+          if (e.type == DioExceptionType.cancel || cancelToken?.isCancelled == true) {
+            rethrow;
+          }
         } catch (e) {
           // try next
         }
@@ -388,6 +406,14 @@ class TeraBoxProvider implements CloudStorageProvider {
     }
 
     throw Exception('TeraBox 파일 다운로드 스트림 연결 실패 (dlink 추출 불가 또는 거부됨)');
+  }
+
+  Future<void> _cancelStream(Stream<List<int>>? stream) async {
+    if (stream == null) return;
+    try {
+      final sub = stream.listen((_) {}, onError: (_) {});
+      await sub.cancel();
+    } catch (_) {}
   }
 
   @override

@@ -135,11 +135,12 @@ class _AddAccountDialogState extends State<AddAccountDialog> {
             decoration: const InputDecoration(labelText: 'ndus 쿠키 값', border: OutlineInputBorder()),
           ),
         ] else if (t == CloudProviderType.baidu) ...[
-          const Text('Baidu Netdisk BDUSS 쿠키 값을 입력하세요.', style: TextStyle(fontSize: 12, color: Colors.white54)),
+          const Text('Baidu Netdisk BDUSS 쿠키 또는 전체 Cookie 문자열(BDUSS=...; STOKEN=...)을 입력하세요.',
+              style: TextStyle(fontSize: 12, color: Colors.white54)),
           const SizedBox(height: 8),
           TextField(
             controller: _tokenController,
-            decoration: const InputDecoration(labelText: 'BDUSS 쿠키 값', border: OutlineInputBorder()),
+            decoration: const InputDecoration(labelText: 'BDUSS 또는 Cookie 문자열', border: OutlineInputBorder()),
           ),
         ] else if (t == CloudProviderType.naver) ...[
           const Text('Naver MYBOX 개인 액세스 토큰(PAT)을 입력하세요.', style: TextStyle(fontSize: 12, color: Colors.white54)),

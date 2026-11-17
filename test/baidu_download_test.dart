@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:dio/dio.dart';
@@ -594,6 +595,183 @@ void main() {
           await tempDir.delete(recursive: true);
         }
       }
+    });
+  });
+
+  group('BaiduProvider cookie normalization & multi-tier downloadStream fallback', () {
+    test('normalizeCookie handles raw BDUSS with trailing =, BDUSS: prefix, and cookie strings', () {
+      expect(
+        BaiduProvider.normalizeCookie('rawTokenValue=='),
+        'PANWEB=1; BDUSS=rawTokenValue==',
+      );
+      expect(
+        BaiduProvider.normalizeCookie('BDUSS: my_bduss_val'),
+        'PANWEB=1; BDUSS=my_bduss_val',
+      );
+      expect(
+        BaiduProvider.normalizeCookie('Cookie: BDUSS=abc; STOKEN=def'),
+        'PANWEB=1; BDUSS=abc; STOKEN=def',
+      );
+    });
+
+    test('downloadStream falls back from failed locatedownload/dlna filemetas to target filemetas without origin=dlna',
+        () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final baseUrl = 'http://127.0.0.1:${server.port}';
+      final filePayload = List<int>.generate(12288, (i) => (i * 5) % 256);
+
+      server.listen((HttpRequest req) async {
+        if (req.uri.path == '/disk/main' || req.uri.path == '/disk/home') {
+          req.response.statusCode = 200;
+          req.response.headers.contentType = ContentType.html;
+          req.response.write('<script>var x = decodeURIComponent("fn%28%22token123456789012345678901234567890%22%29");</script>');
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/rest/2.0/pcs/file') {
+          req.response.statusCode = 403;
+          req.response.headers.contentType = ContentType.json;
+          req.response.write('{"error_code":31326,"error_msg":"anti hotlink"}');
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/api/filemetas') {
+          final origin = req.uri.queryParameters['origin'];
+          final target = req.uri.queryParameters['target'];
+          if (origin == 'dlna') {
+            req.response.statusCode = 200;
+            req.response.headers.contentType = ContentType.json;
+            req.response.write('{"errno":9019,"errmsg":"hit illegal dlna"}');
+            await req.response.close();
+            return;
+          }
+          if (target != null && target.contains('/comics/vol1.zip')) {
+            req.response.statusCode = 200;
+            req.response.headers.contentType = ContentType.json;
+            req.response.write(jsonEncode({
+              'errno': 0,
+              'info': [
+                {'dlink': '$baseUrl/dlink-redirect'}
+              ],
+            }));
+            await req.response.close();
+            return;
+          }
+          req.response.statusCode = 200;
+          req.response.headers.contentType = ContentType.json;
+          req.response.write('{"errno":2,"errmsg":"param error"}');
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/dlink-redirect') {
+          req.response.statusCode = 302;
+          req.response.headers.set('Location', '$baseUrl/cdn-file');
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/cdn-file') {
+          final ua = req.headers.value('user-agent') ?? '';
+          if (ua != 'pan.baidu.com') {
+            req.response.statusCode = 403;
+            await req.response.close();
+            return;
+          }
+          req.response.statusCode = 200;
+          req.response.headers.contentType = ContentType.binary;
+          req.response.headers.contentLength = filePayload.length;
+          req.response.add(filePayload);
+          await req.response.close();
+          return;
+        }
+        req.response.statusCode = 404;
+        await req.response.close();
+      });
+
+      final baidu = BaiduProvider(
+        account: CloudAccount(
+          id: 'baidu_e2e',
+          name: 'Baidu E2E',
+          type: CloudProviderType.baidu,
+          email: '',
+          accessToken: 'raw_bduss_token==',
+        ),
+        panBaseUrl: baseUrl,
+        dPcsBaseUrl: baseUrl,
+        cPcsBaseUrl: baseUrl,
+      );
+
+      final stream = await baidu.downloadStream(fileId: '998877|/comics/vol1.zip');
+      final collected = await stream.expand((c) => c).toList();
+      expect(collected, equals(filePayload));
+    });
+
+    test('downloadStream retries PCS URL without Referer on 403 when using locatedownload ver=4.0',
+        () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final baseUrl = 'http://127.0.0.1:${server.port}';
+      final filePayload = List<int>.generate(10000, (i) => i % 199);
+
+      server.listen((HttpRequest req) async {
+        if (req.uri.path == '/disk/main' || req.uri.path == '/disk/home') {
+          req.response.statusCode = 302;
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/rest/2.0/pcs/file' &&
+            req.uri.queryParameters['method'] == 'locatedownload') {
+          if (req.uri.queryParameters['ver'] == '4.0') {
+            req.response.statusCode = 200;
+            req.response.headers.contentType = ContentType.json;
+            req.response.write(jsonEncode({
+              'urls': [
+                {'url': '$baseUrl/pcs-cdn'}
+              ],
+            }));
+          } else {
+            req.response.statusCode = 403;
+            req.response.write('{"error_code":31360}');
+          }
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/pcs-cdn') {
+          final referer = req.headers.value('referer');
+          final ua = req.headers.value('user-agent') ?? '';
+          // Reject requests that carry web Referer; accept native PCS UA without Referer
+          if (referer != null || ua != BaiduProvider.pcsUserAgent) {
+            req.response.statusCode = 403;
+            await req.response.close();
+            return;
+          }
+          req.response.statusCode = 200;
+          req.response.headers.contentType = ContentType.binary;
+          req.response.headers.contentLength = filePayload.length;
+          req.response.add(filePayload);
+          await req.response.close();
+          return;
+        }
+        req.response.statusCode = 404;
+        await req.response.close();
+      });
+
+      final baidu = BaiduProvider(
+        account: CloudAccount(
+          id: 'baidu_v4',
+          name: 'Baidu V4',
+          type: CloudProviderType.baidu,
+          email: '',
+          accessToken: 'BDUSS=test_v4',
+        ),
+        panBaseUrl: baseUrl,
+        dPcsBaseUrl: baseUrl,
+        cPcsBaseUrl: baseUrl,
+      );
+
+      final stream = await baidu.downloadStream(fileId: '555|/video.mp4');
+      final collected = await stream.expand((c) => c).toList();
+      expect(collected, equals(filePayload));
     });
   });
 }

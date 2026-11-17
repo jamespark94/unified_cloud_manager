@@ -1,12 +1,109 @@
+import 'dart:async';
+import 'dart:typed_data';
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:unified_cloud_manager/core/cloud/cloud_item.dart';
+import 'package:unified_cloud_manager/core/cloud/cloud_storage_provider.dart';
 import 'package:unified_cloud_manager/core/database/app_database.dart';
 import 'package:unified_cloud_manager/core/database/transfer_task_entity.dart';
 import 'package:unified_cloud_manager/core/transfer/transfer_queue_manager.dart';
 import 'package:unified_cloud_manager/ui/screens/transfer_dashboard_screen.dart';
 import 'package:unified_cloud_manager/ui/widgets/cloud_item_tile.dart';
+
+class _StreamingTestSourceProvider implements CloudStorageProvider {
+  final int totalBytes;
+  final StreamController<List<int>> controller = StreamController<List<int>>();
+
+  _StreamingTestSourceProvider({required this.totalBytes});
+
+  @override
+  String get providerId => 'terabox_stream_test';
+
+  @override
+  String get providerName => 'TeraBox Stream Test';
+
+  @override
+  CloudProviderType get providerType => CloudProviderType.terabox;
+
+  @override
+  Future<List<CloudItem>> listItems({required String folderIdOrPath}) async => [];
+
+  @override
+  Future<CloudItem> createFolder({required String parentId, required String folderName}) async =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> deleteItem({required String idOrPath, required bool isFolder}) async {}
+
+  @override
+  Future<Stream<List<int>>> downloadStream({
+    required String fileId,
+    int? startByte,
+    int? endByte,
+    CancelToken? cancelToken,
+    void Function(int actualStartByte)? onActualStartByte,
+  }) async {
+    onActualStartByte?.call(0);
+    return controller.stream;
+  }
+
+  @override
+  Future<void> uploadStream({
+    required String parentId,
+    required String fileName,
+    required Stream<List<int>> stream,
+    required int length,
+    Function(int bytesSent, int totalBytes)? onProgress,
+  }) async {}
+}
+
+class _CountingSinkProvider implements CloudStorageProvider {
+  @override
+  String get providerId => 'sink_stream_test';
+
+  @override
+  String get providerName => 'Sink Stream Test';
+
+  @override
+  CloudProviderType get providerType => CloudProviderType.local;
+
+  @override
+  Future<List<CloudItem>> listItems({required String folderIdOrPath}) async => [];
+
+  @override
+  Future<CloudItem> createFolder({required String parentId, required String folderName}) async =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> deleteItem({required String idOrPath, required bool isFolder}) async {}
+
+  @override
+  Future<Stream<List<int>>> downloadStream({
+    required String fileId,
+    int? startByte,
+    int? endByte,
+    CancelToken? cancelToken,
+    void Function(int actualStartByte)? onActualStartByte,
+  }) async =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> uploadStream({
+    required String parentId,
+    required String fileName,
+    required Stream<List<int>> stream,
+    required int length,
+    Function(int bytesSent, int totalBytes)? onProgress,
+  }) async {
+    int sent = 0;
+    await for (final chunk in stream) {
+      sent += chunk.length;
+      onProgress?.call(sent, length);
+    }
+  }
+}
 
 void main() {
   setUpAll(() async {
@@ -214,6 +311,84 @@ void main() {
       expect(find.text('done.txt'), findsOneWidget);
 
       await tester.runAsync(() => TransferQueueManager.instance.clearCompleted());
+    });
+
+    testWidgets('TransferDashboardScreen updates live progress past 10% through completion across ProviderScope lifecycles',
+        (tester) async {
+      const total = 1000;
+      final src = _StreamingTestSourceProvider(totalBytes: total);
+      final dst = _CountingSinkProvider();
+      final mgr = TransferQueueManager.instance;
+      mgr.registerProvider(src);
+      mgr.registerProvider(dst);
+
+      try {
+        final now = DateTime.now();
+        final task = TransferTask(
+          id: 'terabox_live_progress_task',
+          providerType: 'terabox',
+          sourceAccountId: src.providerId,
+          destAccountId: dst.providerId,
+          taskType: TransferTaskType.download,
+          fileName: 'terabox_video.mp4',
+          sourcePath: '101|/terabox_video.mp4',
+          destinationPath: '/tmp',
+          totalBytes: total,
+          transferredBytes: 0,
+          status: TransferStatus.pending,
+          createdAt: now,
+          updatedAt: now,
+        );
+
+        await tester.runAsync(() async {
+          await mgr.enqueueTask(task);
+          // Deliver initial 10% (100 bytes) before mounting dashboard
+          src.controller.add(Uint8List(100));
+          await Future.delayed(const Duration(milliseconds: 250));
+        });
+
+        await tester.pumpWidget(
+          const ProviderScope(
+            child: MaterialApp(
+              home: TransferDashboardScreen(),
+            ),
+          ),
+        );
+        await tester.runAsync(() => Future.delayed(const Duration(milliseconds: 100)));
+        await tester.pumpAndSettle();
+
+        expect(find.text('terabox_video.mp4'), findsOneWidget);
+        expect(find.textContaining('10.0%'), findsOneWidget);
+
+        // Deliver next 40% (to 50%) after 220ms so UI throttle emits
+        await tester.runAsync(() async {
+          await Future.delayed(const Duration(milliseconds: 220));
+          src.controller.add(Uint8List(400));
+          await Future.delayed(const Duration(milliseconds: 50));
+        });
+        await tester.pump();
+        expect(find.textContaining('50.0%'), findsOneWidget);
+
+        // Complete the transfer (remaining 500 bytes + close)
+        await tester.runAsync(() async {
+          await Future.delayed(const Duration(milliseconds: 220));
+          src.controller.add(Uint8List(500));
+          await src.controller.close();
+          await Future.delayed(const Duration(milliseconds: 150));
+        });
+        await tester.pump();
+        await tester.pumpAndSettle();
+
+        expect(find.textContaining('100.0%'), findsOneWidget);
+        expect(find.text('완료'), findsOneWidget);
+      } finally {
+        await tester.runAsync(() async {
+          if (!src.controller.isClosed) await src.controller.close();
+          await mgr.clearCompleted();
+          mgr.unregisterProvider(src.providerId);
+          mgr.unregisterProvider(dst.providerId);
+        });
+      }
     });
   });
 }

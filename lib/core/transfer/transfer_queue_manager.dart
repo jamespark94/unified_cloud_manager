@@ -72,6 +72,11 @@ class TransferQueueManager extends ChangeNotifier {
   static final TransferQueueManager instance = TransferQueueManager._();
   TransferQueueManager._();
 
+  // Process-wide singleton; keep alive across ProviderScope teardowns.
+  @override
+  // ignore: must_call_super
+  void dispose() {}
+
   final AppDatabase _db = AppDatabase.instance;
   final Map<String, CloudStorageProvider> _providers = {};
 
@@ -224,6 +229,7 @@ class TransferQueueManager extends ChangeNotifier {
 
     _activeTaskIds.remove(taskId);
     await _db.updateTaskStatus(taskId, TransferStatus.paused);
+    _taskListVersion++;
     if (_activeTaskIds.isEmpty) {
       _globalSpeedEstimator.reset();
       currentSpeedBytesPerSec = 0.0;
@@ -245,6 +251,7 @@ class TransferQueueManager extends ChangeNotifier {
       );
     }
     await _db.updateTaskStatus(taskId, TransferStatus.pending);
+    _taskListVersion++;
     notifyListeners();
     processQueue();
   }
@@ -350,6 +357,7 @@ class TransferQueueManager extends ChangeNotifier {
     _activeTaskIds.clear();
     _globalSpeedEstimator.reset();
     currentSpeedBytesPerSec = 0.0;
+    _taskListVersion++;
     await BackgroundServiceManager.instance.stopServiceIfIdle();
     notifyListeners();
   }
@@ -371,6 +379,7 @@ class TransferQueueManager extends ChangeNotifier {
         }
       }
     }
+    _taskListVersion++;
     notifyListeners();
     processQueue();
   }
@@ -525,6 +534,7 @@ class TransferQueueManager extends ChangeNotifier {
 
         _activeTaskIds.add(nextTask.id);
         await _db.updateTaskStatus(nextTask.id, TransferStatus.active);
+        _taskListVersion++;
         await BackgroundServiceManager.instance.startServiceIfNeeded();
         _executeTask(nextTask);
       }
@@ -830,6 +840,7 @@ class TransferQueueManager extends ChangeNotifier {
       speedBytesPerSec: 0.0,
       status: TransferStatus.paused,
     );
+    _taskListVersion++;
   }
 
   Future<void> _markCompleted(TransferTask task, int total, int transferred) async {

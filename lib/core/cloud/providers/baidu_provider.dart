@@ -22,10 +22,23 @@ class BaiduProvider implements CloudStorageProvider {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
   static const String pcsUserAgent = 'LogStatistic';
 
+  @visibleForTesting
+  final String panBaseUrl;
+  @visibleForTesting
+  final String dPcsBaseUrl;
+  @visibleForTesting
+  final String cPcsBaseUrl;
+
   String? _cachedJsToken;
   DateTime? _jsTokenExpiry;
 
-  BaiduProvider({required this.account, this.onAccountUpdated}) {
+  BaiduProvider({
+    required this.account,
+    this.onAccountUpdated,
+    this.panBaseUrl = 'https://pan.baidu.com',
+    this.dPcsBaseUrl = 'https://d.pcs.baidu.com',
+    this.cPcsBaseUrl = 'https://c.pcs.baidu.com',
+  }) {
     if (account.refreshToken != null &&
         account.refreshToken!.isNotEmpty &&
         account.tokenExpiry != null &&
@@ -44,17 +57,38 @@ class BaiduProvider implements CloudStorageProvider {
   @override
   CloudProviderType get providerType => CloudProviderType.baidu;
 
-  String get _cookieHeader {
-    var token = account.accessToken.replaceAll(RegExp(r'[\r\n]+'), ' ').trim();
+  static String normalizeCookie(String raw) {
+    var token = raw.replaceAll(RegExp(r'[\r\n]+'), ' ').trim();
+    if (token.isEmpty) return '';
     if (token.toLowerCase().startsWith('cookie:')) {
       token = token.substring(7).trim();
     }
-    var cookie = token.contains('=') ? token : 'BDUSS=$token';
-    if (!cookie.contains('PANWEB=')) {
+
+    final matchColon = RegExp(r'^BDUSS\s*:\s*(.+)$', caseSensitive: false).firstMatch(token);
+    if (matchColon != null) {
+      token = 'BDUSS=${matchColon.group(1)!.trim()}';
+    }
+
+    final hasNamedCookieKey = RegExp(
+      r'(^|;\s*)(BDUSS|STOKEN|BAIDUID|PANWEB|PTOKEN|SCRC)\s*=',
+      caseSensitive: false,
+    ).hasMatch(token);
+
+    String cookie;
+    if (hasNamedCookieKey) {
+      cookie = token;
+    } else {
+      final clean = token.replaceAll('"', '').replaceAll("'", '').trim();
+      cookie = 'BDUSS=$clean';
+    }
+
+    if (!RegExp(r'(^|;\s*)PANWEB\s*=', caseSensitive: false).hasMatch(cookie)) {
       cookie = 'PANWEB=1; $cookie';
     }
     return cookie;
   }
+
+  String get _cookieHeader => normalizeCookie(account.accessToken);
 
   Map<String, String> get _headers => {
         'User-Agent': defaultUserAgent,
@@ -212,9 +246,9 @@ class BaiduProvider implements CloudStorageProvider {
       return _cachedJsToken;
     }
 
-    const urls = [
-      'https://pan.baidu.com/disk/main',
-      'https://pan.baidu.com/disk/home',
+    final urls = [
+      '$panBaseUrl/disk/main',
+      '$panBaseUrl/disk/home',
     ];
 
     for (final url in urls) {
@@ -258,8 +292,11 @@ class BaiduProvider implements CloudStorageProvider {
   }
 
   String? _parseJsTokenFromHtml(String html) {
-    final mUrlEnc = RegExp(r'fn%28%22([a-zA-Z0-9_]+)%22%29').firstMatch(html);
-    if (mUrlEnc != null) return mUrlEnc.group(1);
+    final mUrlEncDouble = RegExp(r'fn%28%22([a-zA-Z0-9_]+)%22%29').firstMatch(html);
+    if (mUrlEncDouble != null) return mUrlEncDouble.group(1);
+
+    final mUrlEncSingle = RegExp(r'fn%28%27([a-zA-Z0-9_]+)%27%29').firstMatch(html);
+    if (mUrlEncSingle != null) return mUrlEncSingle.group(1);
 
     final m1 = RegExp(r'window\.jsToken\s*=\s*[\x22\x27]([a-zA-Z0-9_]+)[\x22\x27]').firstMatch(html);
     if (m1 != null) return m1.group(1);
@@ -270,12 +307,85 @@ class BaiduProvider implements CloudStorageProvider {
     final m3 = RegExp(r'fn\s*\(\s*[\x22\x27]([a-zA-Z0-9_]{32,})[\x22\x27]\s*\)').firstMatch(html);
     if (m3 != null) return m3.group(1);
 
-    try {
-      final decoded = Uri.decodeComponent(html);
-      final mDec = RegExp(r'fn\s*\(\s*[\x22\x27]([a-zA-Z0-9_]{32,})[\x22\x27]\s*\)').firstMatch(decoded);
-      if (mDec != null) return mDec.group(1);
-    } catch (_) {}
+    // Decode only targeted decodeURIComponent('...') blocks instead of whole HTML (CSS '%' breaks Uri.decodeComponent).
+    for (final match in RegExp(r'decodeURIComponent\s*\(\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]\s*\)').allMatches(html)) {
+      final raw = match.group(1);
+      if (raw == null || raw.isEmpty) continue;
+      try {
+        final decoded = Uri.decodeComponent(raw);
+        final mDec = RegExp(r'fn\s*\(\s*[\x22\x27]([a-zA-Z0-9_]{32,})[\x22\x27]\s*\)').firstMatch(decoded);
+        if (mDec != null) return mDec.group(1);
+      } catch (_) {}
+    }
 
+    return null;
+  }
+
+  static const List<String> _pcsUserAgents = [
+    pcsUserAgent,
+    'netdisk;P2SP;3.0.10.22',
+    'netdisk;2.2.51.6;netdisk;10.0.19041;PC;pc-mac',
+    'netdisk;12.1.2;android;android-android;12;SM-A908N',
+    'pan.baidu.com',
+    defaultUserAgent,
+  ];
+
+  static const List<String> _dlinkUserAgents = [
+    'pan.baidu.com',
+    'netdisk;P2SP;3.0.10.22',
+    'netdisk;2.2.51.6;netdisk;10.0.19041;PC;pc-mac',
+    'netdisk;12.1.2;android;android-android;12;SM-A908N',
+    pcsUserAgent,
+    defaultUserAgent,
+  ];
+
+  void _addCandidateUrl(List<String> target, String? url) {
+    if (url == null) return;
+    final trimmed = url.trim();
+    if (!trimmed.startsWith('http')) return;
+    // On Android/iOS cleartext HTTP is blocked by default; try HTTPS upgrade first for Baidu CDN/PCS URLs.
+    if (trimmed.startsWith('http://') &&
+        (trimmed.contains('baidupcs.com') || trimmed.contains('pcs.baidu.com'))) {
+      final httpsUrl = 'https://${trimmed.substring(7)}';
+      if (!target.contains(httpsUrl)) {
+        target.add(httpsUrl);
+      }
+    }
+    if (!target.contains(trimmed)) {
+      target.add(trimmed);
+    }
+  }
+
+  Future<Stream<List<int>>?> _tryOpenCandidateUrls({
+    required List<String> urls,
+    required List<String> userAgents,
+    required Set<String> triedPairs,
+    int? startByte,
+    int? endByte,
+    CancelToken? cancelToken,
+    void Function(int actualStartByte)? onActualStartByte,
+    List<String>? failureReasons,
+  }) async {
+    for (final url in urls) {
+      for (final ua in userAgents) {
+        _throwIfCancelled(cancelToken);
+        final key = '$ua|$url';
+        if (!triedPairs.add(key)) continue;
+
+        final stream = await _openValidatedStream(
+          url,
+          ua,
+          startByte: startByte,
+          endByte: endByte,
+          cancelToken: cancelToken,
+          onActualStartByte: onActualStartByte,
+          failureReasons: failureReasons,
+        );
+        if (stream != null) {
+          return stream;
+        }
+      }
+    }
     return null;
   }
 
@@ -307,41 +417,258 @@ class BaiduProvider implements CloudStorageProvider {
 
     final jsToken = await _ensureJsToken(cancelToken: cancelToken);
     final failureReasons = <String>[];
-    final candidateUrls = await _collectCandidateDownloadUrls(
-      fsId: fsId,
-      filePath: filePath,
-      jsToken: jsToken,
-      cancelToken: cancelToken,
-      failureReasons: failureReasons,
-    );
+    final triedPairs = <String>{};
 
-    const userAgents = [
-      pcsUserAgent,
-      'netdisk;P2SP;3.0.10.22',
-      'netdisk;12.1.2;android;android-android;12;SM-A908N',
-      'pan.baidu.com',
-      defaultUserAgent,
-    ];
+    // Tier 1: PCS locatedownload (ver=4.0 desktop/P2SP & ver=2.0 legacy PCS)
+    if (filePath.isNotEmpty) {
+      final locateUrls = <String>[];
+      final locatedSpecs = [
+        (ver: '4.0', extra: '&ehps=0&clienttype=0&channel=chunlei', ua: 'netdisk;P2SP;3.0.10.22'),
+        (ver: '2.0', extra: '', ua: pcsUserAgent),
+      ];
+      for (final spec in locatedSpecs) {
+        for (final aid in const [appId, '778750', '266719']) {
+          final pcsUrl =
+              '$dPcsBaseUrl/rest/2.0/pcs/file?method=locatedownload&app_id=$aid&path=${Uri.encodeComponent(filePath)}&ver=${spec.ver}&dtype=1&esl=1${spec.extra}';
+          final data = await _getJsonMap(
+            pcsUrl,
+            headers: {
+              'User-Agent': spec.ua,
+              'Cookie': _cookieHeader,
+              'Referer': 'https://pan.baidu.com/',
+            },
+            cancelToken: cancelToken,
+          );
+          if (data != null) {
+            final urls = data['urls'];
+            if (urls is List) {
+              for (final entry in urls) {
+                if (entry is Map) {
+                  _addCandidateUrl(locateUrls, entry['url']?.toString());
+                }
+              }
+            }
+            if (data['server'] != null && data['path'] != null) {
+              final serverStr = data['server'].toString();
+              if (serverStr.startsWith('http')) {
+                _addCandidateUrl(locateUrls, '$serverStr${data['path']}');
+              }
+            }
+            if (data['error_code'] != null) {
+              failureReasons.add(
+                'locatedownload(${spec.ver}/$aid): ${data['error_code']} ${data['error_msg'] ?? ''}'.trim(),
+              );
+            }
+            if (locateUrls.isNotEmpty) {
+              final stream = await _tryOpenCandidateUrls(
+                urls: locateUrls,
+                userAgents: _pcsUserAgents,
+                triedPairs: triedPairs,
+                startByte: startByte,
+                endByte: endByte,
+                cancelToken: cancelToken,
+                onActualStartByte: onActualStartByte,
+                failureReasons: failureReasons,
+              );
+              if (stream != null) return stream;
+              locateUrls.clear();
+            }
+          }
+        }
+      }
+    }
 
-    for (final url in candidateUrls) {
-      for (final ua in userAgents) {
-        _throwIfCancelled(cancelToken);
-        final stream = await _openValidatedStream(
-          url,
-          ua,
+    // Tier 2: pan.baidu.com /api/filemetas (standard first without origin=dlna, then with origin=dlna; both target and fsids)
+    if (fsId.isNotEmpty || filePath.isNotEmpty) {
+      final metaUrls = <String>[];
+      final metaQueries = <Map<String, String>>[
+        if (filePath.isNotEmpty)
+          {
+            'app_id': appId,
+            'web': '1',
+            'channel': 'chunlei',
+            'clienttype': '0',
+            'dlink': '1',
+            'target': jsonEncode([filePath]),
+            if (jsToken != null && jsToken.isNotEmpty) 'jsToken': jsToken,
+          },
+        if (fsId.isNotEmpty)
+          {
+            'app_id': appId,
+            'web': '1',
+            'channel': 'chunlei',
+            'clienttype': '0',
+            'dlink': '1',
+            'fsids': '[$fsId]',
+            if (jsToken != null && jsToken.isNotEmpty) 'jsToken': jsToken,
+          },
+        if (filePath.isNotEmpty)
+          {
+            'app_id': appId,
+            'web': '1',
+            'channel': 'chunlei',
+            'clienttype': '0',
+            'dlink': '1',
+            'origin': 'dlna',
+            'target': jsonEncode([filePath]),
+            if (jsToken != null && jsToken.isNotEmpty) 'jsToken': jsToken,
+          },
+        if (fsId.isNotEmpty)
+          {
+            'app_id': appId,
+            'web': '1',
+            'channel': 'chunlei',
+            'clienttype': '0',
+            'dlink': '1',
+            'origin': 'dlna',
+            'fsids': '[$fsId]',
+            if (jsToken != null && jsToken.isNotEmpty) 'jsToken': jsToken,
+          },
+      ];
+
+      for (final queryParams in metaQueries) {
+        final metaUri = Uri.parse('$panBaseUrl/api/filemetas').replace(
+          queryParameters: queryParams,
+        );
+        final data = await _getJsonMap(metaUri.toString(), cancelToken: cancelToken);
+        if (data != null &&
+            data['errno'] == 0 &&
+            data['info'] is List &&
+            (data['info'] as List).isNotEmpty) {
+          _addCandidateUrl(metaUrls, data['info'][0]['dlink']?.toString());
+          if (metaUrls.isNotEmpty) {
+            final stream = await _tryOpenCandidateUrls(
+              urls: metaUrls,
+              userAgents: _dlinkUserAgents,
+              triedPairs: triedPairs,
+              startByte: startByte,
+              endByte: endByte,
+              cancelToken: cancelToken,
+              onActualStartByte: onActualStartByte,
+              failureReasons: failureReasons,
+            );
+            if (stream != null) return stream;
+            metaUrls.clear();
+          }
+        } else if (data != null) {
+          failureReasons.add('filemetas: errno=${data['errno']}');
+          debugPrint('[BaiduProvider] filemetas unexpected response: $data');
+        }
+      }
+
+      if (fsId.isNotEmpty) {
+        final xpanUri = Uri.parse('$panBaseUrl/rest/2.0/xpan/multimedia').replace(
+          queryParameters: {
+            'method': 'filemetas',
+            'fsids': '[$fsId]',
+            'dlink': '1',
+          },
+        );
+        final xpanData = await _getJsonMap(xpanUri.toString(), cancelToken: cancelToken);
+        if (xpanData != null &&
+            xpanData['errno'] == 0 &&
+            xpanData['list'] is List &&
+            (xpanData['list'] as List).isNotEmpty) {
+          _addCandidateUrl(metaUrls, xpanData['list'][0]['dlink']?.toString());
+          if (metaUrls.isNotEmpty) {
+            final stream = await _tryOpenCandidateUrls(
+              urls: metaUrls,
+              userAgents: _dlinkUserAgents,
+              triedPairs: triedPairs,
+              startByte: startByte,
+              endByte: endByte,
+              cancelToken: cancelToken,
+              onActualStartByte: onActualStartByte,
+              failureReasons: failureReasons,
+            );
+            if (stream != null) return stream;
+          }
+        }
+      }
+    }
+
+    // Tier 3: pan.baidu.com /api/download JSON API (with sign + timestamp, without forcing vip=2)
+    if (fsId.isNotEmpty) {
+      final signInfo = await _fetchDownloadSign(cancelToken: cancelToken);
+      final dlParams = <String, String>{
+        'app_id': appId,
+        'web': '1',
+        'channel': 'chunlei',
+        'clienttype': '0',
+        'type': 'dlink',
+        'fidlist': '[$fsId]',
+        if (jsToken != null && jsToken.isNotEmpty) 'jsToken': jsToken,
+        if (signInfo != null) 'sign': signInfo.sign,
+        if (signInfo != null) 'timestamp': signInfo.timestamp,
+        if (signInfo != null && signInfo.bdstoken.isNotEmpty) 'bdstoken': signInfo.bdstoken,
+      };
+      final dlUri = Uri.parse('$panBaseUrl/api/download').replace(
+        queryParameters: dlParams,
+      );
+      var data = await _getJsonMap(dlUri.toString(), cancelToken: cancelToken);
+      if (data == null || data['errno'] != 0) {
+        data = await _postJsonMap(
+          '$panBaseUrl/api/download?app_id=$appId&web=1&channel=chunlei&clienttype=0',
+          body: dlParams,
+          cancelToken: cancelToken,
+        );
+      }
+      if (data != null &&
+          data['errno'] == 0 &&
+          data['dlink'] is List &&
+          (data['dlink'] as List).isNotEmpty) {
+        final dlUrls = <String>[];
+        _addCandidateUrl(dlUrls, data['dlink'][0]['dlink']?.toString());
+        final stream = await _tryOpenCandidateUrls(
+          urls: dlUrls,
+          userAgents: _dlinkUserAgents,
+          triedPairs: triedPairs,
           startByte: startByte,
           endByte: endByte,
           cancelToken: cancelToken,
           onActualStartByte: onActualStartByte,
           failureReasons: failureReasons,
         );
-        if (stream != null) {
-          return stream;
-        }
+        if (stream != null) return stream;
+      } else if (data != null) {
+        failureReasons.add('api/download: errno=${data['errno']}');
       }
     }
 
-    final detail = failureReasons.isNotEmpty ? ' - ${failureReasons.last}' : '';
+    // Tier 4: Direct PCS method=download fallback
+    if (filePath.isNotEmpty) {
+      final directPcsUrls = <String>[];
+      for (final aid in const ['778750', '266719', appId, '498065']) {
+        _addCandidateUrl(
+          directPcsUrls,
+          '$dPcsBaseUrl/rest/2.0/pcs/file?method=download&app_id=$aid&path=${Uri.encodeComponent(filePath)}',
+        );
+        _addCandidateUrl(
+          directPcsUrls,
+          '$cPcsBaseUrl/rest/2.0/pcs/file?method=download&app_id=$aid&path=${Uri.encodeComponent(filePath)}',
+        );
+      }
+      final stream = await _tryOpenCandidateUrls(
+        urls: directPcsUrls,
+        userAgents: _pcsUserAgents,
+        triedPairs: triedPairs,
+        startByte: startByte,
+        endByte: endByte,
+        cancelToken: cancelToken,
+        onActualStartByte: onActualStartByte,
+        failureReasons: failureReasons,
+      );
+      if (stream != null) return stream;
+    }
+
+    final uniqueReasons = <String>[];
+    for (final r in failureReasons) {
+      if (r.isNotEmpty && !uniqueReasons.contains(r)) {
+        uniqueReasons.add(r);
+        if (uniqueReasons.length >= 3) break;
+      }
+    }
+    final detail = uniqueReasons.isNotEmpty ? ' - ${uniqueReasons.join('; ')}' : '';
     throw Exception('Baidu 파일 다운로드 스트림 연결 실패 (모든 엔드포인트 거부$detail)');
   }
 
@@ -384,7 +711,7 @@ class BaiduProvider implements CloudStorageProvider {
     CancelToken? cancelToken,
   }) async {
     try {
-      final uri = Uri.parse('https://pan.baidu.com/api/gettemplatevariable').replace(
+      final uri = Uri.parse('$panBaseUrl/api/gettemplatevariable').replace(
         queryParameters: {
           'app_id': appId,
           'web': '1',
@@ -415,6 +742,18 @@ class BaiduProvider implements CloudStorageProvider {
     return null;
   }
 
+  Map<String, dynamic>? _decodeJsonMap(String? body) {
+    if (body == null) return null;
+    final trimmed = body.trimLeft();
+    if (!trimmed.startsWith('{')) return null;
+    try {
+      final decoded = jsonDecode(trimmed);
+      if (decoded is Map<String, dynamic>) return decoded;
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    } catch (_) {}
+    return null;
+  }
+
   Future<Map<String, dynamic>?> _getJsonMap(
     String url, {
     Map<String, String>? headers,
@@ -432,11 +771,7 @@ class BaiduProvider implements CloudStorageProvider {
           validateStatus: (_) => true,
         ),
       );
-      if (res.statusCode == 200 && res.data != null) {
-        final decoded = jsonDecode(res.data!);
-        if (decoded is Map<String, dynamic>) return decoded;
-        if (decoded is Map) return Map<String, dynamic>.from(decoded);
-      }
+      return _decodeJsonMap(res.data);
     } on DioException catch (e) {
       if (e.type == DioExceptionType.cancel) rethrow;
       debugPrint('[BaiduProvider] GET JSON failed ($url): $e');
@@ -446,146 +781,36 @@ class BaiduProvider implements CloudStorageProvider {
     return null;
   }
 
-  Future<List<String>> _collectCandidateDownloadUrls({
-    required String fsId,
-    required String filePath,
-    String? jsToken,
+  Future<Map<String, dynamic>?> _postJsonMap(
+    String url, {
+    required Map<String, String> body,
+    Map<String, String>? headers,
     CancelToken? cancelToken,
-    List<String>? failureReasons,
   }) async {
-    final candidateUrls = <String>[];
-    void addUrl(String? url) {
-      if (url != null && url.startsWith('http') && !candidateUrls.contains(url)) {
-        candidateUrls.add(url);
-      }
-    }
-
-    // 1. PCS locatedownload (대용량 파일/비디오 고속 직링크 CDN 목록)
-    if (filePath.isNotEmpty) {
-      for (final aid in const [appId, '778750', '266719']) {
-        final pcsUrl =
-            'https://d.pcs.baidu.com/rest/2.0/pcs/file?method=locatedownload&app_id=$aid&path=${Uri.encodeComponent(filePath)}&ver=2.0&dtype=1&esl=1';
-        final data = await _getJsonMap(
-          pcsUrl,
+    _throwIfCancelled(cancelToken);
+    try {
+      final res = await _dio.post<String>(
+        url,
+        data: body,
+        cancelToken: cancelToken,
+        options: Options(
           headers: {
-            'User-Agent': pcsUserAgent,
-            'Cookie': _cookieHeader,
-            'Referer': 'https://pan.baidu.com/',
+            ...(headers ?? _headers),
+            'Content-Type': 'application/x-www-form-urlencoded',
           },
-          cancelToken: cancelToken,
-        );
-        if (data != null) {
-          final urls = data['urls'];
-          if (urls is List) {
-            for (final entry in urls) {
-              if (entry is Map) {
-                addUrl(entry['url']?.toString());
-              }
-            }
-          }
-          if (data['server'] != null && data['path'] != null) {
-            final serverStr = data['server'].toString();
-            if (serverStr.startsWith('http')) {
-              addUrl('$serverStr${data['path']}');
-            }
-          }
-          if (data['error_code'] != null) {
-            failureReasons?.add('locatedownload($aid): ${data['error_code']} ${data['error_msg'] ?? ''}');
-          }
-          if (candidateUrls.isNotEmpty) break;
-        }
-      }
-    }
-
-    // 2. pan.baidu.com /api/filemetas & xpan filemetas (dlink 추출)
-    if (fsId.isNotEmpty || filePath.isNotEmpty) {
-      final queryParams = <String, String>{
-        'app_id': appId,
-        'web': '1',
-        'channel': 'chunlei',
-        'clienttype': '0',
-        'dlink': '1',
-        'origin': 'dlna',
-        if (jsToken != null && jsToken.isNotEmpty) 'jsToken': jsToken,
-      };
-      if (fsId.isNotEmpty) {
-        queryParams['fsids'] = '[$fsId]';
-      } else {
-        queryParams['target'] = jsonEncode([filePath]);
-      }
-
-      final metaUri = Uri.parse('https://pan.baidu.com/api/filemetas').replace(
-        queryParameters: queryParams,
+          responseType: ResponseType.plain,
+          receiveTimeout: const Duration(seconds: 12),
+          validateStatus: (_) => true,
+        ),
       );
-      final data = await _getJsonMap(metaUri.toString(), cancelToken: cancelToken);
-      if (data != null &&
-          data['errno'] == 0 &&
-          data['info'] is List &&
-          (data['info'] as List).isNotEmpty) {
-        addUrl(data['info'][0]['dlink']?.toString());
-      } else if (data != null) {
-        failureReasons?.add('filemetas: errno=${data['errno']}');
-        debugPrint('[BaiduProvider] filemetas unexpected response: $data');
-      }
-
-      if (fsId.isNotEmpty) {
-        final xpanUri = Uri.parse('https://pan.baidu.com/rest/2.0/xpan/multimedia').replace(
-          queryParameters: {
-            'method': 'filemetas',
-            'fsids': '[$fsId]',
-            'dlink': '1',
-          },
-        );
-        final xpanData = await _getJsonMap(xpanUri.toString(), cancelToken: cancelToken);
-        if (xpanData != null &&
-            xpanData['errno'] == 0 &&
-            xpanData['list'] is List &&
-            (xpanData['list'] as List).isNotEmpty) {
-          addUrl(xpanData['list'][0]['dlink']?.toString());
-        }
-      }
+      return _decodeJsonMap(res.data);
+    } on DioException catch (e) {
+      if (e.type == DioExceptionType.cancel) rethrow;
+      debugPrint('[BaiduProvider] POST JSON failed ($url): $e');
+    } catch (e) {
+      debugPrint('[BaiduProvider] POST JSON failed ($url): $e');
     }
-
-    // 3. pan.baidu.com /api/download JSON API에서 dlink 추출 (sign + timestamp 포함)
-    if (fsId.isNotEmpty) {
-      final signInfo = await _fetchDownloadSign(cancelToken: cancelToken);
-      final dlParams = <String, String>{
-        'app_id': appId,
-        'web': '1',
-        'channel': 'chunlei',
-        'clienttype': '0',
-        'type': 'dlink',
-        'fidlist': '[$fsId]',
-        'vip': '2',
-        if (jsToken != null && jsToken.isNotEmpty) 'jsToken': jsToken,
-        if (signInfo != null) 'sign': signInfo.sign,
-        if (signInfo != null) 'timestamp': signInfo.timestamp,
-        if (signInfo != null && signInfo.bdstoken.isNotEmpty) 'bdstoken': signInfo.bdstoken,
-      };
-      final dlUri = Uri.parse('https://pan.baidu.com/api/download').replace(
-        queryParameters: dlParams,
-      );
-      final data = await _getJsonMap(dlUri.toString(), cancelToken: cancelToken);
-      if (data != null &&
-          data['errno'] == 0 &&
-          data['dlink'] is List &&
-          (data['dlink'] as List).isNotEmpty) {
-        addUrl(data['dlink'][0]['dlink']?.toString());
-      } else if (data != null) {
-        failureReasons?.add('api/download: errno=${data['errno']}');
-      }
-    }
-
-    // 4. 폴백: PCS direct method=download
-    if (filePath.isNotEmpty) {
-      for (final aid in const ['778750', '266719', appId]) {
-        addUrl(
-          'https://d.pcs.baidu.com/rest/2.0/pcs/file?method=download&app_id=$aid&path=${Uri.encodeComponent(filePath)}',
-        );
-      }
-    }
-
-    return candidateUrls;
+    return null;
   }
 
   @visibleForTesting
@@ -615,6 +840,48 @@ class BaiduProvider implements CloudStorageProvider {
     void Function(int actualStartByte)? onActualStartByte,
     List<String>? failureReasons,
   }) async {
+    final stream = await _openValidatedStreamAttempt(
+      initialUrl,
+      userAgent,
+      includeReferer: true,
+      startByte: startByte,
+      endByte: endByte,
+      cancelToken: cancelToken,
+      onActualStartByte: onActualStartByte,
+      failureReasons: failureReasons,
+    );
+    if (stream != null) return stream;
+
+    // Some Baidu PCS/CDN nodes reject requests carrying a pan.baidu.com Referer when using native/PCS UAs.
+    final isPcsOrCdn = initialUrl.contains('pcs.baidu.com') ||
+        initialUrl.contains('baidupcs.com') ||
+        initialUrl.startsWith(dPcsBaseUrl) ||
+        initialUrl.startsWith(cPcsBaseUrl);
+    if (isPcsOrCdn && userAgent != defaultUserAgent) {
+      return _openValidatedStreamAttempt(
+        initialUrl,
+        userAgent,
+        includeReferer: false,
+        startByte: startByte,
+        endByte: endByte,
+        cancelToken: cancelToken,
+        onActualStartByte: onActualStartByte,
+        failureReasons: failureReasons,
+      );
+    }
+    return null;
+  }
+
+  Future<Stream<List<int>>?> _openValidatedStreamAttempt(
+    String initialUrl,
+    String userAgent, {
+    required bool includeReferer,
+    int? startByte,
+    int? endByte,
+    CancelToken? cancelToken,
+    void Function(int actualStartByte)? onActualStartByte,
+    List<String>? failureReasons,
+  }) async {
     var currentUrl = initialUrl;
 
     for (var hop = 0; hop < 6; hop++) {
@@ -623,7 +890,7 @@ class BaiduProvider implements CloudStorageProvider {
         final headers = <String, dynamic>{
           'User-Agent': userAgent,
           'Cookie': _cookieHeader,
-          'Referer': 'https://pan.baidu.com/',
+          if (includeReferer) 'Referer': 'https://pan.baidu.com/',
           'Accept': '*/*',
         };
         if (startByte != null || endByte != null) {

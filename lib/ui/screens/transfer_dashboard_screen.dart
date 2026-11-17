@@ -21,6 +21,7 @@ class _TransferDashboardScreenState extends ConsumerState<TransferDashboardScree
   bool _isLoading = true;
   int _lastObservedVersion = -1;
   bool _isFetching = false;
+  bool _needsRefetch = false;
 
   @override
   void initState() {
@@ -29,16 +30,22 @@ class _TransferDashboardScreenState extends ConsumerState<TransferDashboardScree
   }
 
   Future<void> _fetchTasks() async {
-    if (_isFetching) return;
+    if (_isFetching) {
+      _needsRefetch = true;
+      return;
+    }
     _isFetching = true;
     try {
-      final tasks = await AppDatabase.instance.getAllTasks();
-      if (mounted) {
-        setState(() {
-          _cachedTasks = tasks;
-          _isLoading = false;
-        });
-      }
+      do {
+        _needsRefetch = false;
+        final tasks = await AppDatabase.instance.getAllTasks();
+        if (mounted) {
+          setState(() {
+            _cachedTasks = tasks;
+            _isLoading = false;
+          });
+        }
+      } while (_needsRefetch && mounted);
     } finally {
       _isFetching = false;
     }
